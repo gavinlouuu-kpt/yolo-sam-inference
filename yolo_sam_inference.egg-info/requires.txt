@@ -1,0 +1,11 @@
+ultralytics
+transformers
+torch
+torchvision
+opencv-python
+numpy
+scikit-image
+
+[dev]
+pytest>=7.0
+pytest-cov>=4.0

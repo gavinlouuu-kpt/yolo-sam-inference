@@ -1,0 +1,29 @@
+Metadata-Version: 2.2
+Name: yolo_sam_inference
+Version: 0.1.0
+Summary: A pipeline for cell segmentation using YOLO and SAM models
+Author: AI Cytometry Team
+Classifier: Programming Language :: Python :: 3
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.8
+Description-Content-Type: text/markdown
+Requires-Dist: ultralytics
+Requires-Dist: transformers
+Requires-Dist: torch
+Requires-Dist: torchvision
+Requires-Dist: opencv-python
+Requires-Dist: numpy
+Requires-Dist: scikit-image
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0; extra == "dev"
+Dynamic: requires-python
+
+This pipeline will take a path as input (containing images .png, .tiff, .jpg etc.) and return the following:
+1. Through yolo will return A list of bounding boxes (essentially identifying background and images with target)
+2. The bounding box will be used as box prompt in sam (the bounding box will be paired with image)
+
+The output of this package will give:
+1. Segmented mask of all the images in a folder
+2. Original image cropped by bounding box
+3. Metrics including the following: Mask area, mask circularity, mask deformability, convex hull of the mask, distribution of pixel intensity within the mask area from the original image
