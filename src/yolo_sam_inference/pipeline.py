@@ -8,6 +8,8 @@ from transformers import SamModel, SamProcessor
 from .utils import calculate_metrics
 import matplotlib.pyplot as plt
 from skimage import measure
+from datetime import datetime
+import uuid
 
 class CellSegmentationPipeline:
     def __init__(
@@ -26,6 +28,7 @@ class CellSegmentationPipeline:
             device: Device to run models on ('cuda' or 'cpu')
         """
         self.device = device
+        self.sam_model_type = sam_model_type
         
         # Initialize YOLO model
         self.yolo_model = YOLO(yolo_model_path)
@@ -33,6 +36,9 @@ class CellSegmentationPipeline:
         # Initialize SAM model and processor from HuggingFace
         self.sam_model = SamModel.from_pretrained(sam_model_type).to(device)
         self.sam_processor = SamProcessor.from_pretrained(sam_model_type)
+        
+        # Generate a unique run ID for this pipeline instance
+        self.run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     
     def process_directory(
         self,
@@ -52,9 +58,10 @@ class CellSegmentationPipeline:
             List of dictionaries containing results for each image
         """
         input_dir = Path(input_dir)
-        output_dir = Path(output_dir)
+        output_dir = Path(output_dir) / self.run_id
         output_dir.mkdir(parents=True, exist_ok=True)
         
+        # Process all images first to gather statistics
         results = []
         image_files = list(input_dir.glob("*.png")) + list(input_dir.glob("*.jpg")) + \
                      list(input_dir.glob("*.tiff"))
@@ -66,6 +73,39 @@ class CellSegmentationPipeline:
                 save_visualizations
             )
             results.append(result)
+        
+        # Calculate run statistics
+        total_cells = sum(result['num_cells'] for result in results)
+        avg_cells_per_image = total_cells / len(results) if results else 0
+        
+        # Aggregate cell metrics across all images
+        all_metrics = []
+        for result in results:
+            all_metrics.extend(result['cell_metrics'])
+            
+        # Calculate aggregate statistics if we have any cells
+        if all_metrics:
+            avg_area = sum(m['area'] for m in all_metrics) / len(all_metrics)
+            avg_circularity = sum(m['circularity'] for m in all_metrics) / len(all_metrics)
+            avg_intensity = sum(m['mean_intensity'] for m in all_metrics) / len(all_metrics)
+            avg_perimeter = sum(m['perimeter'] for m in all_metrics) / len(all_metrics)
+        
+        # Save comprehensive run information
+        with open(output_dir / "run_info.txt", "w") as f:
+            f.write(f"Run ID: {self.run_id}\n")
+            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+            
+            f.write(f"Input Directory: {input_dir.absolute()}\n")
+            f.write(f"Images Processed: {len(results)}\n")
+            f.write(f"Total Cells: {total_cells}\n")
+            f.write(f"Average Cells/Image: {avg_cells_per_image:.1f}\n\n")
+            
+            if all_metrics:
+                f.write("Average Cell Metrics:\n")
+                f.write(f"  Area: {avg_area:.1f} pixels\n")
+                f.write(f"  Circularity: {avg_circularity:.3f}\n")
+                f.write(f"  Intensity: {avg_intensity:.1f}\n")
+                f.write(f"  Perimeter: {avg_perimeter:.1f} pixels\n")
         
         return results
     
@@ -193,6 +233,8 @@ class CellSegmentationPipeline:
             'original': base_dir / "1_original_images",
             'yolo': base_dir / "2_yolo_detections",
             'processed': base_dir / "3_processed_masks",
+            'processed_masks': base_dir / "3_processed_masks/masks",
+            'processed_overlays': base_dir / "3_processed_masks/overlay_images",
             'combined': base_dir / "4_combined_visualization"
         }
         
@@ -226,7 +268,7 @@ class CellSegmentationPipeline:
             plt.figure(figsize=(10, 10))
             plt.imshow(mask, cmap='gray')
             plt.axis('off')
-            plt.savefig(str(dirs['processed'] / f"{output_path.stem}_mask_{i}.png"), 
+            plt.savefig(str(dirs['processed_masks'] / f"{output_path.stem}_mask_{i}.png"), 
                        bbox_inches='tight', dpi=150)
             plt.close()
             
@@ -235,7 +277,7 @@ class CellSegmentationPipeline:
             plt.imshow(image)
             plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap='Reds')
             plt.axis('off')
-            plt.savefig(str(dirs['processed'] / f"{output_path.stem}_mask_{i}_overlay.png"), 
+            plt.savefig(str(dirs['processed_overlays'] / f"{output_path.stem}_mask_{i}_overlay.png"), 
                        bbox_inches='tight', dpi=150)
             plt.close()
         
