@@ -4,6 +4,7 @@ import mlflow
 from mlflow.tracking import MlflowClient
 import os
 import logging
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -84,25 +85,59 @@ def main():
             
             # Calculate summary statistics
             if cell_count > 0:
+                # Basic metrics
                 areas = [m['area'] for m in result['cell_metrics']]
                 circularities = [m['circularity'] for m in result['cell_metrics']]
-                mean_intensities = [m['mean_intensity'] for m in result['cell_metrics']]
+                deformabilities = [m['deformability'] for m in result['cell_metrics']]
+                perimeters = [m['perimeter'] for m in result['cell_metrics']]
+                
+                # Shape metrics
+                area_ratios = [m['area_ratio'] for m in result['cell_metrics']]
+                convex_hull_areas = [m['convex_hull_area'] for m in result['cell_metrics']]
+                aspect_ratios = [m['aspect_ratio'] for m in result['cell_metrics']]
+                
+                # Brightness metrics
+                mean_brightnesses = [m['mean_brightness'] for m in result['cell_metrics']]
+                brightness_stds = [m['brightness_std'] for m in result['cell_metrics']]
                 
                 logger.info(f"Summary statistics:")
-                logger.info(f"Average area: {sum(areas)/len(areas):.2f} pixels")
-                logger.info(f"Average circularity: {sum(circularities)/len(circularities):.3f}")
-                logger.info(f"Average mean intensity: {sum(mean_intensities)/len(mean_intensities):.2f}")
+                # Basic metrics
+                logger.info(f"Area: {sum(areas)/len(areas):.2f} ± {np.std(areas):.2f} pixels")
+                logger.info(f"Circularity: {sum(circularities)/len(circularities):.3f} ± {np.std(circularities):.3f}")
+                logger.info(f"Deformability: {sum(deformabilities)/len(deformabilities):.3f} ± {np.std(deformabilities):.3f}")
+                logger.info(f"Perimeter: {sum(perimeters)/len(perimeters):.2f} ± {np.std(perimeters):.2f} pixels")
+                
+                # Shape metrics
+                logger.info(f"Area ratio: {sum(area_ratios)/len(area_ratios):.3f} ± {np.std(area_ratios):.3f}")
+                logger.info(f"Convex hull area: {sum(convex_hull_areas)/len(convex_hull_areas):.2f} ± {np.std(convex_hull_areas):.2f} pixels")
+                logger.info(f"Aspect ratio: {sum(aspect_ratios)/len(aspect_ratios):.3f} ± {np.std(aspect_ratios):.3f}")
+                
+                # Brightness metrics
+                logger.info(f"Mean brightness: {sum(mean_brightnesses)/len(mean_brightnesses):.2f} ± {np.std(mean_brightnesses):.2f}")
+                logger.info(f"Brightness std: {sum(brightness_stds)/len(brightness_stds):.2f} ± {np.std(brightness_stds):.2f}")
             
-            # Each cell's metrics
+            # Each cell's detailed metrics
             for i, metrics in enumerate(result['cell_metrics']):
                 logger.debug(f"\nCell {i+1} details:")
+                # Basic metrics
                 logger.debug(f"Area: {metrics['area']} pixels")
                 logger.debug(f"Circularity: {metrics['circularity']:.3f}")
                 logger.debug(f"Deformability: {metrics['deformability']:.3f}")
-                logger.debug(f"Mean intensity: {metrics['mean_intensity']:.2f}")
-                logger.debug(f"Convex hull area: {metrics['convex_hull_area']} pixels")
                 logger.debug(f"Perimeter: {metrics['perimeter']:.2f} pixels")
                 
+                # Shape metrics
+                logger.debug(f"Area ratio: {metrics['area_ratio']:.3f}")
+                logger.debug(f"Convex hull area: {metrics['convex_hull_area']} pixels")
+                logger.debug(f"Aspect ratio: {metrics['aspect_ratio']:.3f}")
+                
+                # Size and position metrics
+                logger.debug(f"Bounding box: x({metrics['min_x']}, {metrics['max_x']}), y({metrics['min_y']}, {metrics['max_y']})")
+                logger.debug(f"Size: {metrics['mask_x_length']}x{metrics['mask_y_length']} pixels")
+                
+                # Brightness metrics
+                logger.debug(f"Mean brightness: {metrics['mean_brightness']:.2f}")
+                logger.debug(f"Brightness std: {metrics['brightness_std']:.2f}")
+
     except Exception as e:
         logger.error(f"An error occurred during pipeline execution: {str(e)}", exc_info=True)
         raise

@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 from skimage import measure
 from datetime import datetime
 import uuid
+import pandas as pd
 
 class CellSegmentationPipeline:
     def __init__(
@@ -66,6 +67,9 @@ class CellSegmentationPipeline:
         image_files = list(input_dir.glob("*.png")) + list(input_dir.glob("*.jpg")) + \
                      list(input_dir.glob("*.tiff"))
         
+        # Prepare data for CSV
+        all_metrics_data = []
+        
         for image_path in image_files:
             result = self.process_single_image(
                 image_path,
@@ -73,6 +77,34 @@ class CellSegmentationPipeline:
                 save_visualizations
             )
             results.append(result)
+            
+            # Add metrics to CSV data
+            for cell_idx, metrics in enumerate(result['cell_metrics']):
+                metrics_row = {
+                    'image_name': image_path.name,
+                    'cell_id': cell_idx,
+                    'deformability': metrics['deformability'],
+                    'area': metrics['area'],
+                    'area_ratio': metrics['area_ratio'],
+                    'circularity': metrics['circularity'],
+                    'convex_hull_area': metrics['convex_hull_area'],
+                    'mask_x_length': metrics['mask_x_length'],
+                    'mask_y_length': metrics['mask_y_length'],
+                    'min_x': metrics['min_x'],
+                    'min_y': metrics['min_y'],
+                    'max_x': metrics['max_x'],
+                    'max_y': metrics['max_y'],
+                    'mean_brightness': metrics['mean_brightness'],
+                    'brightness_std': metrics['brightness_std'],
+                    'perimeter': metrics['perimeter'],
+                    'aspect_ratio': metrics['aspect_ratio']
+                }
+                all_metrics_data.append(metrics_row)
+        
+        # Save metrics to CSV
+        if all_metrics_data:
+            metrics_df = pd.DataFrame(all_metrics_data)
+            metrics_df.to_csv(output_dir / 'cell_metrics.csv', index=False)
         
         # Calculate run statistics
         total_cells = sum(result['num_cells'] for result in results)
@@ -87,7 +119,7 @@ class CellSegmentationPipeline:
         if all_metrics:
             avg_area = sum(m['area'] for m in all_metrics) / len(all_metrics)
             avg_circularity = sum(m['circularity'] for m in all_metrics) / len(all_metrics)
-            avg_intensity = sum(m['mean_intensity'] for m in all_metrics) / len(all_metrics)
+            avg_brightness = sum(m['mean_brightness'] for m in all_metrics) / len(all_metrics)
             avg_perimeter = sum(m['perimeter'] for m in all_metrics) / len(all_metrics)
         
         # Save comprehensive run information
@@ -104,7 +136,7 @@ class CellSegmentationPipeline:
                 f.write("Average Cell Metrics:\n")
                 f.write(f"  Area: {avg_area:.1f} pixels\n")
                 f.write(f"  Circularity: {avg_circularity:.3f}\n")
-                f.write(f"  Intensity: {avg_intensity:.1f}\n")
+                f.write(f"  Brightness: {avg_brightness:.1f}\n")
                 f.write(f"  Perimeter: {avg_perimeter:.1f} pixels\n")
         
         return results

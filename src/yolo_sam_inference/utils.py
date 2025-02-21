@@ -29,24 +29,42 @@ def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
     
     # Calculate circularity
     perimeter = props.perimeter
-    circularity = 4 * np.pi * area / (perimeter * perimeter) if perimeter > 0 else 0
+    circularity = (2 * np.sqrt(np.pi * area)) / perimeter if perimeter > 0 else 0
     
     # Calculate convex hull area
     convex_hull_area = props.convex_area
+
+    area_ratio = convex_hull_area / area
     
-    # Calculate deformability (ratio of actual area to convex hull area)
-    deformability = area / convex_hull_area if convex_hull_area > 0 else 0
+    # Calculate deformability 
+    deformability = 1 - circularity 
     
-    # Calculate intensity metrics (convert RGB to grayscale)
-    intensity_image = np.mean(image, axis=2)  # Shape will be (H, W)
-    mask_intensity = intensity_image[mask]
-    mean_intensity = np.mean(mask_intensity) if mask_intensity.size > 0 else 0
-    
+    # Calculate brightness metrics (convert RGB to grayscale)
+    brightness_image = np.mean(image, axis=2)  # Shape will be (H, W)
+    mask_brightness = brightness_image[mask]
+    mean_brightness = np.mean(mask_brightness) if mask_brightness.size > 0 else 0
+    brightness_std = np.std(mask_brightness) if mask_brightness.size > 0 else 0
+
+    # Calculate aspect ratio
+    min_x, min_y, max_x, max_y = props.bbox
+    aspect_ratio = (max_x - min_x) / (max_y - min_y) if (max_x - min_x) > 0 and (max_y - min_y) > 0 else 0
+    mask_x_length = max_x - min_x
+    mask_y_length = max_y - min_y
+
     return {
-        "area": int(area),
-        "circularity": float(circularity),
         "deformability": float(deformability),
+        "area": int(area),
+        "area_ratio": float(area_ratio),
+        "circularity": float(circularity),
         "convex_hull_area": int(convex_hull_area),
-        "mean_intensity": float(mean_intensity),
-        "perimeter": float(perimeter)
+        "mask_x_length": int(mask_x_length),
+        "mask_y_length": int(mask_y_length),
+        "min_x": int(min_x),
+        "min_y": int(min_y),
+        "max_x": int(max_x),
+        "max_y": int(max_y),
+        "mean_brightness": float(mean_brightness),
+        "brightness_std": float(brightness_std),
+        "perimeter": float(perimeter),
+        "aspect_ratio": float(aspect_ratio),
     } 
