@@ -163,34 +163,6 @@ class CellSegmentationPipeline:
         if save_visualizations:
             self._save_visualizations(image, masks, boxes, output_path)
             
-            # Additionally save raw SAM masks
-            output_path = Path(output_path)
-            raw_sam_dir = output_path.parent / "4_raw_sam_masks"
-            raw_sam_dir.mkdir(parents=True, exist_ok=True)
-            
-            for i, raw_mask in enumerate(raw_sam_masks):
-                # Ensure raw mask is 2D
-                if len(raw_mask.shape) > 2:
-                    raw_mask = raw_mask.squeeze()
-                
-                plt.figure(figsize=(10, 10))
-                plt.imshow(raw_mask, cmap='gray')
-                plt.axis('off')
-                plt.savefig(str(raw_sam_dir / f"{output_path.stem}_raw_mask_{i}.png"),
-                          bbox_inches='tight', dpi=150)
-                plt.close()
-                
-                # Save raw mask overlay with SAM transformed image
-                plt.figure(figsize=(10, 10))
-                # Normalize SAM transformed image for visualization
-                sam_vis_image = (sam_transformed_image - sam_transformed_image.min()) / (sam_transformed_image.max() - sam_transformed_image.min())
-                plt.imshow(sam_vis_image)
-                plt.imshow(np.ma.masked_where(~raw_mask, raw_mask), alpha=0.5, cmap='Blues')
-                plt.axis('off')
-                plt.savefig(str(raw_sam_dir / f"{output_path.stem}_raw_mask_{i}_sam_overlay.png"),
-                          bbox_inches='tight', dpi=150)
-                plt.close()
-        
         return {
             "image_path": str(image_path),
             "cell_metrics": cell_metrics,
@@ -219,11 +191,9 @@ class CellSegmentationPipeline:
         # Create separate directories for each output type
         dirs = {
             'original': base_dir / "1_original_images",
-            'sam_transformed': base_dir / "2_sam_transformed",
-            'yolo': base_dir / "3_yolo_detections",
-            'raw_sam': base_dir / "4_raw_sam_masks",
-            'processed': base_dir / "5_processed_masks",
-            'combined': base_dir / "6_combined_visualization"
+            'yolo': base_dir / "2_yolo_detections",
+            'processed': base_dir / "3_processed_masks",
+            'combined': base_dir / "4_combined_visualization"
         }
         
         # Create all directories
@@ -238,43 +208,13 @@ class CellSegmentationPipeline:
                    bbox_inches='tight', dpi=150)
         plt.close()
         
-        # 2. Save SAM transformed image
-        sam_inputs = self.sam_processor(image, return_tensors="pt")
-        sam_transformed_image = sam_inputs['pixel_values'].squeeze().permute(1, 2, 0).cpu().numpy()
-        
-        # Normalize the transformed image for visualization
-        sam_transformed_image = (sam_transformed_image - sam_transformed_image.min()) / (sam_transformed_image.max() - sam_transformed_image.min())
-        
-        plt.figure(figsize=(10, 10))
-        plt.imshow(sam_transformed_image)
-        plt.title('SAM Transformed Input Image')
-        plt.axis('off')
-        plt.savefig(str(dirs['sam_transformed'] / f"{output_path.stem}_sam_transformed.png"), 
-                   bbox_inches='tight', dpi=150)
-        
-        # Save side by side comparison
-        plt.figure(figsize=(20, 10))
-        plt.subplot(121)
-        plt.imshow(image)
-        plt.title('Original Image')
-        plt.axis('off')
-        
-        plt.subplot(122)
-        plt.imshow(sam_transformed_image)
-        plt.title('SAM Transformed Image')
-        plt.axis('off')
-        
-        plt.savefig(str(dirs['sam_transformed'] / f"{output_path.stem}_comparison.png"), 
-                   bbox_inches='tight', dpi=150)
-        plt.close()
-        
         # 3. Save YOLO detections
         plt.figure(figsize=(10, 10))
         plt.imshow(image)
         for box in boxes:
             x1, y1, x2, y2 = box
             plt.gca().add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
-                               fill=False, color='red', linewidth=2))
+                               fill=False, color='red', linewidth=1, alpha=0.3))
         plt.axis('off')
         plt.savefig(str(dirs['yolo'] / f"{output_path.stem}_yolo.png"), 
                    bbox_inches='tight', dpi=150)
@@ -293,10 +233,7 @@ class CellSegmentationPipeline:
             # Save mask overlay on original image
             plt.figure(figsize=(10, 10))
             plt.imshow(image)
-            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.5, cmap='Reds')
-            contours = measure.find_contours(mask.astype(np.uint8), 0.5)
-            for contour in contours:
-                plt.plot(contour[:, 1], contour[:, 0], color='red', linewidth=2)
+            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap='Reds')
             plt.axis('off')
             plt.savefig(str(dirs['processed'] / f"{output_path.stem}_mask_{i}_overlay.png"), 
                        bbox_inches='tight', dpi=150)
@@ -311,20 +248,20 @@ class CellSegmentationPipeline:
         for box in boxes:
             x1, y1, x2, y2 = box
             plt.gca().add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
-                               fill=False, color='red', linewidth=2))
+                               fill=False, color='red', linewidth=1, alpha=0.3))
         plt.title('Original Image with YOLO Detections')
         plt.axis('off')
         
         # All masks overlay
         plt.subplot(122)
         plt.imshow(image)
-        colors = [(1,0,0,0.3), (0,1,0,0.3), (0,0,1,0.3)]
+        colors = [(1,0,0,0.2), (0,1,0,0.2), (0,0,1,0.2)]
         for i, mask in enumerate(masks):
             color = colors[i % len(colors)]
-            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.5, cmap=plt.cm.get_cmap('Reds'))
+            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap=plt.cm.get_cmap('Reds'))
             contours = measure.find_contours(mask.astype(np.uint8), 0.5)
             for contour in contours:
-                plt.plot(contour[:, 1], contour[:, 0], color='red', linewidth=2)
+                plt.plot(contour[:, 1], contour[:, 0], color='red', linewidth=1, alpha=0.3)
         plt.title('All Masks Overlay')
         plt.axis('off')
         
