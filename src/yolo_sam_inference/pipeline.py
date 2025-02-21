@@ -233,7 +233,7 @@ class CellSegmentationPipeline:
         
         # Save all visualizations if requested
         if save_visualizations:
-            self._save_visualizations(image, masks, boxes, output_path)
+            self._save_visualizations(image, masks, boxes, cell_metrics, output_path)
             
         return {
             "image_path": str(image_path),
@@ -246,6 +246,7 @@ class CellSegmentationPipeline:
         image: np.ndarray,
         masks: List[np.ndarray],
         boxes: np.ndarray,
+        cell_metrics: List[Dict[str, Any]],
         output_path: Union[str, Path]
     ) -> None:
         """
@@ -255,6 +256,7 @@ class CellSegmentationPipeline:
             image: Original input image
             masks: List of processed masks
             boxes: YOLO detection boxes
+            cell_metrics: List of metrics for each cell
             output_path: Path to save outputs
         """
         output_path = Path(output_path)
@@ -267,8 +269,18 @@ class CellSegmentationPipeline:
             'processed': base_dir / "3_processed_masks",
             'processed_masks': base_dir / "3_processed_masks/masks",
             'processed_overlays': base_dir / "3_processed_masks/overlay_images",
+            'convex_hull': base_dir / "3_processed_masks/convex_hull_overlay",
             'combined': base_dir / "4_combined_visualization"
         }
+        
+        # Define color scheme for masks and convex hulls
+        colors = [
+            ('Reds', '#00ff00'),      # Red mask, Green hull
+            ('Blues', '#ff8c00'),     # Blue mask, Orange hull
+            ('Greens', '#ff00ff'),    # Green mask, Magenta hull
+            ('Purples', '#ffff00'),   # Purple mask, Yellow hull
+            ('Oranges', '#00ffff'),   # Orange mask, Cyan hull
+        ]
         
         # Create all directories
         for dir_path in dirs.values():
@@ -282,7 +294,7 @@ class CellSegmentationPipeline:
                    bbox_inches='tight', dpi=150)
         plt.close()
         
-        # 3. Save YOLO detections
+        # 2. Save YOLO detections
         plt.figure(figsize=(10, 10))
         plt.imshow(image)
         for box in boxes:
@@ -294,8 +306,10 @@ class CellSegmentationPipeline:
                    bbox_inches='tight', dpi=150)
         plt.close()
         
-        # 4 & 5. Save individual masks (both raw and processed)
-        for i, mask in enumerate(masks):
+        # 3. Save individual masks and overlays
+        for i, (mask, metrics) in enumerate(zip(masks, cell_metrics)):
+            mask_cmap, hull_color = colors[i % len(colors)]
+            
             # Save processed mask
             plt.figure(figsize=(10, 10))
             plt.imshow(mask, cmap='gray')
@@ -307,13 +321,32 @@ class CellSegmentationPipeline:
             # Save mask overlay on original image
             plt.figure(figsize=(10, 10))
             plt.imshow(image)
-            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap='Reds')
+            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap=mask_cmap)
             plt.axis('off')
             plt.savefig(str(dirs['processed_overlays'] / f"{output_path.stem}_mask_{i}_overlay.png"), 
                        bbox_inches='tight', dpi=150)
             plt.close()
+            
+            # Save convex hull overlay
+            plt.figure(figsize=(10, 10))
+            plt.imshow(image)
+            # Plot the mask with lower alpha
+            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.2, cmap=mask_cmap)
+            # Plot the convex hull outline with higher alpha and thicker line
+            if 'convex_hull_coords' in metrics and len(metrics['convex_hull_coords']) > 0:
+                hull_coords = metrics['convex_hull_coords']
+                plt.plot(hull_coords[:, 1], hull_coords[:, 0], color=hull_color, 
+                        linewidth=3, alpha=1.0, label=f'Convex Hull {i+1}')
+                # Fill the convex hull with a different pattern
+                plt.fill(hull_coords[:, 1], hull_coords[:, 0], color=hull_color, 
+                        alpha=0.1, hatch='///')
+            plt.legend()
+            plt.axis('off')
+            plt.savefig(str(dirs['convex_hull'] / f"{output_path.stem}_mask_{i}_convex_hull.png"), 
+                       bbox_inches='tight', dpi=150)
+            plt.close()
         
-        # 6. Save combined visualization
+        # 4. Save combined visualization
         plt.figure(figsize=(20, 10))
         
         # Original with YOLO boxes
@@ -326,19 +359,34 @@ class CellSegmentationPipeline:
         plt.title('Original Image with YOLO Detections')
         plt.axis('off')
         
-        # All masks overlay
+        # All masks and convex hulls overlay
         plt.subplot(122)
         plt.imshow(image)
-        colors = [(1,0,0,0.2), (0,1,0,0.2), (0,0,1,0.2)]
-        for i, mask in enumerate(masks):
-            color = colors[i % len(colors)]
-            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap=plt.cm.get_cmap('Reds'))
-            contours = measure.find_contours(mask.astype(np.uint8), 0.5)
-            for contour in contours:
-                plt.plot(contour[:, 1], contour[:, 0], color='red', linewidth=1, alpha=0.3)
-        plt.title('All Masks Overlay')
+        legend_elements = []
+        for i, (mask, metrics) in enumerate(zip(masks, cell_metrics)):
+            mask_cmap, hull_color = colors[i % len(colors)]
+            # Plot mask with lower alpha
+            plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.2, cmap=mask_cmap)
+            # Plot convex hull with higher alpha and pattern
+            if 'convex_hull_coords' in metrics and len(metrics['convex_hull_coords']) > 0:
+                hull_coords = metrics['convex_hull_coords']
+                # Fill the convex hull with a pattern
+                plt.fill(hull_coords[:, 1], hull_coords[:, 0], color=hull_color, 
+                        alpha=0.1, hatch='///')
+                # Draw the outline
+                hull_line = plt.plot(hull_coords[:, 1], hull_coords[:, 0], 
+                                   color=hull_color, linewidth=3, alpha=1.0)[0]
+                legend_elements.append((f'Cell {i+1} Mask', plt.Rectangle((0,0), 1, 1, fc=plt.cm.get_cmap(mask_cmap)(0.5), alpha=0.2)))
+                legend_elements.append((f'Cell {i+1} Hull', hull_line))
+        
+        if legend_elements:
+            plt.legend([patch if isinstance(patch, plt.Rectangle) else line 
+                       for patch, line in legend_elements],
+                      [label for label, _ in legend_elements],
+                      loc='center left', bbox_to_anchor=(1, 0.5))
+        plt.title('Masks and Convex Hulls Overlay')
         plt.axis('off')
         
         plt.savefig(str(dirs['combined'] / f"{output_path.stem}_combined.png"), 
-                   bbox_inches='tight', dpi=150)
+                   bbox_inches='tight', dpi=150, bbox_extra_artists=[patch for _, patch in legend_elements])
         plt.close() 
