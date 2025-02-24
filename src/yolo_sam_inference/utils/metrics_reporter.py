@@ -4,6 +4,41 @@ from .logger import setup_logger
 
 logger = setup_logger(__name__)
 
+def calculate_summary_statistics(cell_metrics):
+    """Calculate summary statistics from cell metrics."""
+    if not cell_metrics:
+        return {}
+    
+    stats = {}
+    for key in cell_metrics[0].keys():
+        if isinstance(cell_metrics[0][key], (int, float)):
+            values = [m[key] for m in cell_metrics]
+            stats[key] = {
+                'mean': sum(values) / len(values),
+                'min': min(values),
+                'max': max(values)
+            }
+    return stats
+
+def report_summary_statistics(stats):
+    """Report summary statistics for cell metrics."""
+    print("\nSummary Statistics:")
+    print("-" * 40)
+    for metric, values in stats.items():
+        print(f"{metric}:")
+        for stat, value in values.items():
+            print(f"  {stat}: {value:.2f}")
+    print("-" * 40)
+
+def report_cell_details(cell_idx, metrics):
+    """Report detailed metrics for a single cell."""
+    print(f"\nCell {cell_idx + 1} Metrics:")
+    print("-" * 40)
+    for metric, value in metrics.items():
+        if isinstance(value, (int, float)):
+            print(f"{metric}: {value:.2f}")
+    print("-" * 40)
+
 def calculate_summary_statistics(metrics_list: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
     """Calculate summary statistics for a list of metrics.
     

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 from transformers import SamModel, SamProcessor
-from .utils import calculate_metrics
+from .utils.metrics import calculate_metrics
 import matplotlib
 # Set non-interactive backend before importing pyplot
 matplotlib.use('Agg')
@@ -16,6 +16,7 @@ import uuid
 import pandas as pd
 import time
 import warnings
+from .utils.image_utils import save_optimized_tiff, save_mask_as_tiff
 
 # Filter out specific warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
@@ -379,7 +380,7 @@ class CellSegmentationPipeline:
         output_path: Union[str, Path]
     ) -> None:
         """
-        Save visualization of the segmentation results in separate folders.
+        Save visualization of the segmentation results in separate folders using optimized TIFF format.
         
         Args:
             image: Original input image
@@ -407,115 +408,74 @@ class CellSegmentationPipeline:
             for dir_path in dirs.values():
                 dir_path.mkdir(parents=True, exist_ok=True)
             
-            # Define color scheme for masks and convex hulls
-            colors = [
-                ('Reds', '#00ff00'),      # Red mask, Green hull
-                ('Blues', '#ff8c00'),     # Blue mask, Orange hull
-                ('Greens', '#ff00ff'),    # Green mask, Magenta hull
-                ('Purples', '#ffff00'),   # Purple mask, Yellow hull
-                ('Oranges', '#00ffff'),   # Orange mask, Cyan hull
-            ]
+            # 1. Save original image
+            save_optimized_tiff(
+                image,
+                dirs['original'] / f"{output_path.stem}_original.tiff",
+                compression='zlib',
+                compression_level=6
+            )
             
-            # Use a context manager for each plot to ensure proper cleanup
-            with plt.style.context('default'):
-                # 1. Save original image
-                plt.figure(figsize=(10, 10))
-                plt.imshow(image)
-                plt.axis('off')
-                plt.savefig(str(dirs['original'] / f"{output_path.stem}_original.png"), 
-                           bbox_inches='tight', dpi=150)
-                plt.close()
+            # 2. Save YOLO detections visualization
+            yolo_vis = image.copy()
+            for box in boxes:
+                x1, y1, x2, y2 = box.astype(int)
+                cv2.rectangle(yolo_vis, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            save_optimized_tiff(
+                yolo_vis,
+                dirs['yolo'] / f"{output_path.stem}_yolo.tiff",
+                compression='zlib'
+            )
+            
+            # 3. Save individual masks and overlays
+            for i, (mask, metrics) in enumerate(zip(masks, cell_metrics)):
+                # Save processed mask
+                save_mask_as_tiff(
+                    mask,
+                    dirs['processed_masks'] / f"{output_path.stem}_mask_{i}.tiff"
+                )
                 
-                # 2. Save YOLO detections
-                plt.figure(figsize=(10, 10))
-                plt.imshow(image)
-                for box in boxes:
-                    x1, y1, x2, y2 = box
-                    plt.gca().add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
-                                       fill=False, color='red', linewidth=1, alpha=0.3))
-                plt.axis('off')
-                plt.savefig(str(dirs['yolo'] / f"{output_path.stem}_yolo.png"), 
-                           bbox_inches='tight', dpi=150)
-                plt.close()
+                # Create and save mask overlay
+                overlay = image.copy()
+                overlay[mask] = overlay[mask] * 0.7 + np.array([255, 0, 0]) * 0.3
+                save_optimized_tiff(
+                    overlay,
+                    dirs['processed_overlays'] / f"{output_path.stem}_mask_{i}_overlay.tiff"
+                )
                 
-                # 3. Save individual masks and overlays
-                for i, (mask, metrics) in enumerate(zip(masks, cell_metrics)):
-                    mask_cmap, hull_color = colors[i % len(colors)]
-                    
-                    # Save processed mask
-                    plt.figure(figsize=(10, 10))
-                    plt.imshow(mask, cmap='gray')
-                    plt.axis('off')
-                    plt.savefig(str(dirs['processed_masks'] / f"{output_path.stem}_mask_{i}.png"), 
-                               bbox_inches='tight', dpi=150)
-                    plt.close()
-                    
-                    # Save mask overlay
-                    plt.figure(figsize=(10, 10))
-                    plt.imshow(image)
-                    plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.3, cmap=mask_cmap)
-                    plt.axis('off')
-                    plt.savefig(str(dirs['processed_overlays'] / f"{output_path.stem}_mask_{i}_overlay.png"), 
-                               bbox_inches='tight', dpi=150)
-                    plt.close()
-                    
-                    # Save convex hull overlay
-                    plt.figure(figsize=(10, 10))
-                    plt.imshow(image)
-                    plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.2, cmap=mask_cmap)
-                    if 'convex_hull_coords' in metrics and len(metrics['convex_hull_coords']) > 0:
-                        hull_coords = metrics['convex_hull_coords']
-                        plt.plot(hull_coords[:, 1], hull_coords[:, 0], color=hull_color, 
-                                linewidth=3, alpha=1.0, label=f'Convex Hull {i+1}')
-                        plt.fill(hull_coords[:, 1], hull_coords[:, 0], color=hull_color, 
-                                alpha=0.1, hatch='///')
-                    plt.legend()
-                    plt.axis('off')
-                    plt.savefig(str(dirs['convex_hull'] / f"{output_path.stem}_mask_{i}_convex_hull.png"), 
-                               bbox_inches='tight', dpi=150)
-                    plt.close()
-                
-                # 4. Save combined visualization
-                plt.figure(figsize=(20, 10))
-                
-                # Original with YOLO boxes
-                plt.subplot(121)
-                plt.imshow(image)
-                for box in boxes:
-                    x1, y1, x2, y2 = box
-                    plt.gca().add_patch(plt.Rectangle((x1, y1), x2-x1, y2-y1, 
-                                       fill=False, color='red', linewidth=1, alpha=0.3))
-                plt.title('Original Image with YOLO Detections')
-                plt.axis('off')
-                
-                # All masks and convex hulls overlay
-                plt.subplot(122)
-                plt.imshow(image)
-                legend_elements = []
-                for i, (mask, metrics) in enumerate(zip(masks, cell_metrics)):
-                    mask_cmap, hull_color = colors[i % len(colors)]
-                    plt.imshow(np.ma.masked_where(~mask, mask), alpha=0.2, cmap=mask_cmap)
-                    if 'convex_hull_coords' in metrics and len(metrics['convex_hull_coords']) > 0:
-                        hull_coords = metrics['convex_hull_coords']
-                        plt.fill(hull_coords[:, 1], hull_coords[:, 0], color=hull_color, 
-                                alpha=0.1, hatch='///')
-                        hull_line = plt.plot(hull_coords[:, 1], hull_coords[:, 0], 
-                                           color=hull_color, linewidth=3, alpha=1.0)[0]
-                        legend_elements.append((f'Cell {i+1} Mask', plt.Rectangle((0,0), 1, 1, fc=plt.cm.get_cmap(mask_cmap)(0.5), alpha=0.2)))
-                        legend_elements.append((f'Cell {i+1} Hull', hull_line))
-                
-                if legend_elements:
-                    plt.legend([patch if isinstance(patch, plt.Rectangle) else line 
-                               for patch, line in legend_elements],
-                              [label for label, _ in legend_elements],
-                              loc='center left', bbox_to_anchor=(1, 0.5))
-                plt.title('Masks and Convex Hulls Overlay')
-                plt.axis('off')
-                
-                plt.savefig(str(dirs['combined'] / f"{output_path.stem}_combined.png"), 
-                           bbox_inches='tight', dpi=150)
-                plt.close()
-                
+                # Create and save convex hull overlay
+                hull_overlay = image.copy()
+                if 'convex_hull_coords' in metrics and len(metrics['convex_hull_coords']) > 0:
+                    hull_coords = metrics['convex_hull_coords'].astype(np.int32)
+                    cv2.polylines(hull_overlay, [hull_coords], True, (0, 255, 0), 2)
+                    cv2.fillPoly(hull_overlay, [hull_coords], (0, 255, 0, 64))
+                save_optimized_tiff(
+                    hull_overlay,
+                    dirs['convex_hull'] / f"{output_path.stem}_mask_{i}_convex_hull.tiff"
+                )
+            
+            # 4. Save combined visualization
+            combined_vis = np.zeros((image.shape[0], image.shape[1] * 2, 3), dtype=np.uint8)
+            # Original with YOLO boxes
+            combined_vis[:, :image.shape[1]] = yolo_vis
+            # Masks and hulls overlay
+            overlay_vis = image.copy()
+            for i, (mask, metrics) in enumerate(zip(masks, cell_metrics)):
+                # Add mask overlay
+                overlay_vis[mask] = overlay_vis[mask] * 0.8 + np.array([255, 0, 0]) * 0.2
+                # Add hull if available
+                if 'convex_hull_coords' in metrics and len(metrics['convex_hull_coords']) > 0:
+                    hull_coords = metrics['convex_hull_coords'].astype(np.int32)
+                    cv2.polylines(overlay_vis, [hull_coords], True, (0, 255, 0), 2)
+            combined_vis[:, image.shape[1]:] = overlay_vis
+            
+            save_optimized_tiff(
+                combined_vis,
+                dirs['combined'] / f"{output_path.stem}_combined.tiff",
+                compression='zlib'
+            )
+     
+            
         except Exception as e:
             print(f"Warning: Error during visualization saving: {str(e)}")
             # Continue processing even if visualization fails 
