@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import List, Dict, Union, Any
+from typing import List, Dict, Union, Any, Optional, Tuple
 import cv2
 import numpy as np
 import torch
@@ -18,9 +18,26 @@ import time
 import warnings
 from .utils.image_utils import save_optimized_tiff, save_mask_as_tiff
 from tqdm import tqdm
+from dataclasses import dataclass
 
 # Filter out specific warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
+
+@dataclass
+class ProcessingResult:
+    """Data class to store processing results for a single image."""
+    image_path: str
+    cell_metrics: List[Dict[str, Any]]
+    num_cells: int
+    timing: Dict[str, float]
+
+@dataclass
+class BatchProcessingResult:
+    """Data class to store processing results for a batch of images."""
+    results: List[ProcessingResult]
+    total_timing: Dict[str, float]
+    metrics_data: List[Dict[str, Any]]
+    timing_data: List[Dict[str, Any]]
 
 class CellSegmentationPipeline:
     def __init__(
@@ -41,194 +58,72 @@ class CellSegmentationPipeline:
         self.device = device
         self.sam_model_type = sam_model_type
         
+        self._initialize_models(yolo_model_path)
+        self.run_id = self._generate_run_id()
+    
+    def _initialize_models(self, yolo_model_path: Union[str, Path]) -> None:
+        """Initialize YOLO and SAM models."""
         # Initialize YOLO model with verbose=False to disable progress output
         self.yolo_model = YOLO(yolo_model_path)
         self.yolo_model.args['verbose'] = False  # Set verbose in args dictionary
         
         # Initialize SAM model and processor from HuggingFace
-        self.sam_model = SamModel.from_pretrained(sam_model_type).to(device)
-        self.sam_processor = SamProcessor.from_pretrained(sam_model_type)
-        
-        # Generate a unique run ID for this pipeline instance
-        self.run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        self.sam_model = SamModel.from_pretrained(self.sam_model_type).to(self.device)
+        self.sam_processor = SamProcessor.from_pretrained(self.sam_model_type)
     
-    def process_directory(
+    @staticmethod
+    def _generate_run_id() -> str:
+        """Generate a unique run ID for this pipeline instance."""
+        return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    
+    def _detect_cells(self, image: np.ndarray) -> np.ndarray:
+        """Run YOLO detection on an image."""
+        yolo_results = self.yolo_model(image)[0]
+        return yolo_results.boxes.xyxy.cpu().numpy()
+    
+    def _process_sam_mask(
         self,
-        input_dir: Union[str, Path],
-        output_dir: Union[str, Path],
-        save_visualizations: bool = True,
-        pbar: tqdm = None
-    ) -> List[Dict[str, Any]]:
-        """
-        Process all images in a directory.
-        
-        Args:
-            input_dir: Directory containing input images
-            output_dir: Directory to save outputs
-            save_visualizations: Whether to save visualization images
-            pbar: Optional tqdm progress bar for tracking progress
-            
-        Returns:
-            List of dictionaries containing results for each image
-        """
-        input_dir = Path(input_dir)
-        output_dir = Path(output_dir) / self.run_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Process all images first to gather statistics
-        results = []
-        image_files = list(input_dir.glob("*.png")) + list(input_dir.glob("*.jpg")) + \
-                     list(input_dir.glob("*.tiff"))
-        
-        # Initialize timing aggregation
-        total_timing = {
-            "image_load": 0,
-            "yolo_detection": 0,
-            "sam_preprocess": 0,
-            "sam_inference_total": 0,
-            "sam_postprocess_total": 0,
-            "metrics_total": 0,
-            "visualization": 0,
-            "total_time": 0,
-            "total_cells": 0
-        }
-        
-        # Prepare data for CSV
-        all_metrics_data = []
-        all_timing_data = []
-        
-        start_time = time.time()
-        for image_path in image_files:
-            result = self.process_single_image(
-                image_path,
-                output_dir / image_path.name,
-                save_visualizations
+        image: np.ndarray,
+        box: np.ndarray,
+        processed_pixel_values: torch.Tensor
+    ) -> Tuple[np.ndarray, float, float]:
+        """Process a single box with SAM model."""
+        # Prepare inputs
+        inputs = self.sam_processor(
+            image,
+            input_boxes=[[box.tolist()]],
+            return_tensors="pt"
+        )
+        processed_boxes = inputs['input_boxes'].to(self.device)
+
+        # Generate mask prediction
+        with torch.no_grad():
+            outputs = self.sam_model(
+                pixel_values=processed_pixel_values,
+                input_boxes=processed_boxes,
+                multimask_output=False,
             )
-            results.append(result)
-            
-            # Aggregate timing data
-            timing = result['timing']
-            for key in total_timing.keys():
-                if key == "total_cells":
-                    total_timing[key] += timing["cells_processed"]
-                elif key in timing:
-                    total_timing[key] += timing[key]
-            
-            # Update progress bar if provided
-            if pbar is not None:
-                pbar.update(1)
-                pbar.set_postfix({'cells': timing["cells_processed"]}, refresh=True)
-            
-            # Add timing data for this image
-            all_timing_data.append({
-                "image_name": image_path.name,
-                "cells_processed": timing["cells_processed"],
-                "image_load_ms": timing["image_load"] * 1000,
-                "yolo_detection_ms": timing["yolo_detection"] * 1000,
-                "sam_preprocess_ms": timing["sam_preprocess"] * 1000,
-                "sam_inference_ms": timing["sam_inference_total"] * 1000,
-                "sam_postprocess_ms": timing["sam_postprocess_total"] * 1000,
-                "metrics_calculation_ms": timing["metrics_total"] * 1000,
-                "visualization_ms": timing["visualization"] * 1000,
-                "total_time_ms": timing["total_time"] * 1000,
-                "avg_time_per_cell_ms": (timing["total_time"] * 1000 / timing["cells_processed"]) if timing["cells_processed"] > 0 else 0
-            })
-            
-            # Add metrics to CSV data
-            for cell_idx, metrics in enumerate(result['cell_metrics']):
-                metrics_row = {
-                    'image_name': image_path.name,
-                    'cell_id': cell_idx,
-                    'deformability': metrics['deformability'],
-                    'area': metrics['area'],
-                    'area_ratio': metrics['area_ratio'],
-                    'circularity': metrics['circularity'],
-                    'convex_hull_area': metrics['convex_hull_area'],
-                    'mask_x_length': metrics['mask_x_length'],
-                    'mask_y_length': metrics['mask_y_length'],
-                    'min_x': metrics['min_x'],
-                    'min_y': metrics['min_y'],
-                    'max_x': metrics['max_x'],
-                    'max_y': metrics['max_y'],
-                    'mean_brightness': metrics['mean_brightness'],
-                    'brightness_std': metrics['brightness_std'],
-                    'perimeter': metrics['perimeter'],
-                    'aspect_ratio': metrics['aspect_ratio']
-                }
-                all_metrics_data.append(metrics_row)
-        
-        total_runtime = time.time() - start_time
-        
-        # Calculate and print aggregate statistics
-        num_images = len(image_files)
-        print("\n" + "=" * 80)
-        print("PIPELINE PERFORMANCE SUMMARY")
-        print("=" * 80)
-        print(f"Total images processed: {num_images}")
-        print(f"Total cells detected: {total_timing['total_cells']}")
-        print(f"Average cells per image: {total_timing['total_cells']/num_images:.1f}")
-        print(f"\nTiming Breakdown (averaged per image):")
-        print(f"Image loading: {(total_timing['image_load']/num_images)*1000:.1f}ms")
-        print(f"YOLO detection: {(total_timing['yolo_detection']/num_images)*1000:.1f}ms")
-        print(f"SAM preprocessing: {(total_timing['sam_preprocess']/num_images)*1000:.1f}ms")
-        print(f"SAM inference: {(total_timing['sam_inference_total']/num_images)*1000:.1f}ms")
-        print(f"SAM postprocessing: {(total_timing['sam_postprocess_total']/num_images)*1000:.1f}ms")
-        print(f"Metrics calculation: {(total_timing['metrics_total']/num_images)*1000:.1f}ms")
-        print(f"Visualization: {(total_timing['visualization']/num_images)*1000:.1f}ms")
-        print(f"\nTotal runtime: {total_runtime:.1f}s")
-        print(f"Average time per image: {(total_runtime/num_images):.1f}s")
-        if total_timing['total_cells'] > 0:
-            print(f"Average time per cell: {(total_runtime/total_timing['total_cells'])*1000:.1f}ms")
-        print("=" * 80)
-        
-        # Save metrics and timing data to CSV
-        if all_metrics_data:
-            metrics_df = pd.DataFrame(all_metrics_data)
-            metrics_df.to_csv(output_dir / 'cell_metrics.csv', index=False)
-        
-        timing_df = pd.DataFrame(all_timing_data)
-        timing_df.to_csv(output_dir / 'processing_times.csv', index=False)
-        
-        # Save comprehensive run information
-        with open(output_dir / "run_summary.txt", "w") as f:
-            f.write(f"Pipeline Run Summary\n")
-            f.write(f"==================\n\n")
-            f.write(f"Run ID: {self.run_id}\n")
-            f.write(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"Input Directory: {input_dir.absolute()}\n")
-            f.write(f"Output Directory: {output_dir.absolute()}\n\n")
-            
-            f.write(f"Processing Statistics\n")
-            f.write(f"====================\n")
-            f.write(f"Total images processed: {num_images}\n")
-            f.write(f"Total cells detected: {total_timing['total_cells']}\n")
-            f.write(f"Average cells per image: {total_timing['total_cells']/num_images:.1f}\n\n")
-            
-            f.write(f"Timing Statistics (averaged per image)\n")
-            f.write(f"===================================\n")
-            f.write(f"Image loading: {(total_timing['image_load']/num_images)*1000:.1f}ms\n")
-            f.write(f"YOLO detection: {(total_timing['yolo_detection']/num_images)*1000:.1f}ms\n")
-            f.write(f"SAM preprocessing: {(total_timing['sam_preprocess']/num_images)*1000:.1f}ms\n")
-            f.write(f"SAM inference: {(total_timing['sam_inference_total']/num_images)*1000:.1f}ms\n")
-            f.write(f"SAM postprocessing: {(total_timing['sam_postprocess_total']/num_images)*1000:.1f}ms\n")
-            f.write(f"Metrics calculation: {(total_timing['metrics_total']/num_images)*1000:.1f}ms\n")
-            f.write(f"Visualization: {(total_timing['visualization']/num_images)*1000:.1f}ms\n\n")
-            
-            f.write(f"Overall Performance\n")
-            f.write(f"==================\n")
-            f.write(f"Total runtime: {total_runtime:.1f}s\n")
-            f.write(f"Average time per image: {(total_runtime/num_images):.1f}s\n")
-            if total_timing['total_cells'] > 0:
-                f.write(f"Average time per cell: {(total_runtime/total_timing['total_cells'])*1000:.1f}ms\n")
-        
-        return results
+
+        # Post-process masks
+        processed_masks = self.sam_processor.post_process_masks(
+            masks=outputs.pred_masks.cpu(),
+            original_sizes=inputs["original_sizes"].cpu(),
+            reshaped_input_sizes=inputs["reshaped_input_sizes"].cpu(),
+            return_tensors="pt"
+        )
+
+        if isinstance(processed_masks, list):
+            processed_masks = torch.stack(processed_masks, dim=0)
+
+        mask = processed_masks[0].squeeze().numpy() > 0.5
+        return mask
     
     def process_single_image(
         self,
         image_path: Union[str, Path],
         output_path: Union[str, Path],
         save_visualizations: bool = True
-    ) -> Dict[str, Any]:
+    ) -> ProcessingResult:
         """
         Process a single image through the pipeline.
         
@@ -240,119 +135,182 @@ class CellSegmentationPipeline:
         Returns:
             Dictionary containing processing results
         """
+        timings = {}
+        
+        # Load and preprocess image
         start_time = time.time()
-        
-        # Read image
-        image_load_start = time.time()
-        image = cv2.imread(str(image_path))
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        original_height, original_width = image.shape[:2]
-        image_load_time = time.time() - image_load_start
-        
-        # Run YOLO detection
-        yolo_start = time.time()
-        yolo_results = self.yolo_model(image)[0]
-        boxes = yolo_results.boxes.xyxy.cpu().numpy()
-        yolo_time = time.time() - yolo_start
-        
-        cell_metrics = []
-        masks = []
-        raw_sam_masks = []
-        
-        # Get SAM transformed image once for visualization and reuse
-        sam_preprocess_start = time.time()
+        image = self._load_image(str(image_path))
+        timings['image_load'] = time.time() - start_time
+
+        # Detect cells with YOLO
+        start_time = time.time()
+        boxes = self._detect_cells(image)
+        timings['yolo_detection'] = time.time() - start_time
+
+        # Prepare SAM inputs
+        start_time = time.time()
         sam_inputs = self.sam_processor(image, return_tensors="pt")
         processed_pixel_values = sam_inputs['pixel_values'].to(self.device)
-        sam_preprocess_time = time.time() - sam_preprocess_start
-        
-        # Process each detected cell
-        sam_inference_total = 0
-        sam_postprocess_total = 0
-        metrics_total = 0
-        
-        for box in boxes:
-            # Process box with SAM
-            box_start = time.time()
-            inputs = self.sam_processor(
-                image,
-                input_boxes=[[box.tolist()]],
-                return_tensors="pt"
-            )
-            
-            # Move inputs to device
-            processed_boxes = inputs['input_boxes'].to(self.device)
-            box_process_time = time.time() - box_start
-            
-            # Generate mask prediction
-            inference_start = time.time()
-            with torch.no_grad():
-                outputs = self.sam_model(
-                    pixel_values=processed_pixel_values,  # Reuse processed image
-                    input_boxes=processed_boxes,
-                    multimask_output=False,
-                )
-            inference_time = time.time() - inference_start
-            sam_inference_total += inference_time
-            
-            # Post-process masks
-            postprocess_start = time.time()
-            # Save raw SAM mask and ensure proper shape handling
-            raw_mask = outputs.pred_masks.cpu()
-            if len(raw_mask.shape) == 5:  # [B, max_masks, 1, H, W]
-                raw_mask = raw_mask.squeeze(2)
-            raw_mask = raw_mask[0].squeeze().numpy() > 0.5
-            raw_sam_masks.append(raw_mask)
-            
-            # Post-process the masks
-            processed_masks = self.sam_processor.post_process_masks(
-                masks=outputs.pred_masks.cpu(),
-                original_sizes=inputs["original_sizes"].cpu(),
-                reshaped_input_sizes=inputs["reshaped_input_sizes"].cpu(),
-                return_tensors="pt"
-            )
+        timings['sam_preprocess'] = time.time() - start_time
 
-            # Handle the list output from post_process_masks
-            if isinstance(processed_masks, list):
-                processed_masks = torch.stack(processed_masks, dim=0)
-            
-            # Convert mask to numpy and binarize
-            mask = processed_masks[0].squeeze().numpy() > 0.5
+        # Process each detected cell
+        masks = []
+        cell_metrics = []
+        sam_times = {'inference': 0.0, 'postprocess': 0.0}
+
+        for box in boxes:
+            mask = self._process_sam_mask(image, box, processed_pixel_values)
             masks.append(mask)
-            postprocess_time = time.time() - postprocess_start
-            sam_postprocess_total += postprocess_time
             
-            # Calculate metrics
-            metrics_start = time.time()
             metrics = calculate_metrics(image, mask)
             cell_metrics.append(metrics)
-            metrics_time = time.time() - metrics_start
-            metrics_total += metrics_time
-        
+
+        timings.update(sam_times)
+
         # Save visualizations if requested
-        vis_time = 0
         if save_visualizations:
-            vis_start = time.time()
+            start_time = time.time()
             self._save_visualizations(image, masks, boxes, cell_metrics, output_path)
-            vis_time = time.time() - vis_start
-        
+            timings['visualization'] = time.time() - start_time
+
+        # Add total time and cells processed
         total_time = time.time() - start_time
+        timings.update({
+            'total_time': total_time,
+            'cells_processed': len(boxes)
+        })
+
+        return ProcessingResult(
+            image_path=str(image_path),
+            cell_metrics=cell_metrics,
+            num_cells=len(cell_metrics),
+            timing=timings
+        )
+    
+    @staticmethod
+    def _load_image(image_path: str) -> np.ndarray:
+        """Load and preprocess an image."""
+        image = cv2.imread(image_path)
+        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    
+    def process_directory(
+        self,
+        input_dir: Union[str, Path],
+        output_dir: Union[str, Path],
+        save_visualizations: bool = True,
+        pbar: Optional[tqdm] = None
+    ) -> BatchProcessingResult:
+        """
+        Process all images in a directory.
+        
+        Args:
+            input_dir: Directory containing input images
+            output_dir: Directory to save outputs
+            save_visualizations: Whether to save visualization images
+            pbar: Optional tqdm progress bar for tracking progress
             
+        Returns:
+            BatchProcessingResult containing results for all images
+        """
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir) / self.run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get all image files
+        image_files = self._get_image_files(input_dir)
+        
+        # Process images and collect results
+        results = []
+        metrics_data = []
+        timing_data = []
+        total_timing = self._initialize_timing_dict()
+
+        for image_path in image_files:
+            result = self.process_single_image(
+                image_path,
+                output_dir / image_path.name,
+                save_visualizations
+            )
+            results.append(result)
+            
+            # Update progress and collect data
+            self._update_progress(pbar, result)
+            self._collect_metrics_data(metrics_data, result)
+            self._collect_timing_data(timing_data, result)
+            self._update_total_timing(total_timing, result.timing)
+
+        return BatchProcessingResult(
+            results=results,
+            total_timing=total_timing,
+            metrics_data=metrics_data,
+            timing_data=timing_data
+        )
+    
+    @staticmethod
+    def _get_image_files(directory: Path) -> List[Path]:
+        """Get all image files from a directory."""
+        return list(directory.glob("*.png")) + list(directory.glob("*.jpg")) + \
+               list(directory.glob("*.tiff"))
+    
+    @staticmethod
+    def _initialize_timing_dict() -> Dict[str, float]:
+        """Initialize timing dictionary with zero values."""
         return {
-            "image_path": str(image_path),
-            "cell_metrics": cell_metrics,
-            "num_cells": len(cell_metrics),
-            "timing": {
-                "image_load": image_load_time,
-                "yolo_detection": yolo_time,
-                "sam_preprocess": sam_preprocess_time,
-                "sam_inference_total": sam_inference_total,
-                "sam_postprocess_total": sam_postprocess_total,
-                "metrics_total": metrics_total,
-                "visualization": vis_time,
-                "total_time": total_time,
-                "cells_processed": len(boxes)
-            }
+            "image_load": 0,
+            "yolo_detection": 0,
+            "sam_preprocess": 0,
+            "sam_inference_total": 0,
+            "sam_postprocess_total": 0,
+            "metrics_total": 0,
+            "visualization": 0,
+            "total_time": 0,
+            "total_cells": 0
         }
+    
+    @staticmethod
+    def _update_progress(pbar: Optional[tqdm], result: ProcessingResult) -> None:
+        """Update progress bar if provided."""
+        if pbar is not None:
+            pbar.update(1)
+            pbar.set_postfix({'cells': result.num_cells}, refresh=True)
+    
+    @staticmethod
+    def _collect_metrics_data(
+        metrics_data: List[Dict[str, Any]],
+        result: ProcessingResult
+    ) -> None:
+        """Collect metrics data from processing result."""
+        for cell_idx, metrics in enumerate(result.cell_metrics):
+            metrics_row = {
+                'image_name': Path(result.image_path).name,
+                'cell_id': cell_idx,
+                **metrics
+            }
+            metrics_data.append(metrics_row)
+    
+    @staticmethod
+    def _collect_timing_data(
+        timing_data: List[Dict[str, Any]],
+        result: ProcessingResult
+    ) -> None:
+        """Collect timing data from processing result."""
+        timing_data.append({
+            'image_name': Path(result.image_path).name,
+            'cells_processed': result.timing["cells_processed"],
+            **{f"{k}_ms": v * 1000 for k, v in result.timing.items() if k != "cells_processed"}
+        })
+    
+    @staticmethod
+    def _update_total_timing(
+        total_timing: Dict[str, float],
+        timing: Dict[str, float]
+    ) -> None:
+        """Update total timing dictionary with new timing data."""
+        for key in total_timing:
+            if key == "total_cells":
+                total_timing[key] += timing["cells_processed"]
+            elif key in timing:
+                total_timing[key] += timing[key]
     
     def _save_visualizations(
         self,

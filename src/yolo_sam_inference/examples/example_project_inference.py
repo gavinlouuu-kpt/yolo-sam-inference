@@ -6,20 +6,25 @@ from yolo_sam_inference import CellSegmentationPipeline
 from yolo_sam_inference.utils import (
     setup_logger,
     load_model_from_mlflow,
-    calculate_summary_statistics,
-    report_summary_statistics,
-    report_cell_details
 )
+from yolo_sam_inference.reporting import (
+    save_results_to_csv,
+    print_summary,
+    save_run_summary
+)
+from yolo_sam_inference.pipeline import BatchProcessingResult
 from pathlib import Path
 import argparse
-import pandas as pd
-import os
+import time
 import shutil
 from tqdm import tqdm
+from datetime import datetime
+import uuid
+from typing import Tuple
 
 # Set up logger with reduced verbosity
 logger = setup_logger(__name__)
-logger.setLevel('INFO')  # Only show INFO and above
+logger.setLevel('INFO')
 
 def parse_args():
     """Parse command line arguments."""
@@ -67,16 +72,7 @@ def parse_args():
     return parser.parse_args()
 
 def collect_images_from_batches(condition_dir):
-    """
-    Collect all images from all batches in a condition directory and copy them to a temporary directory,
-    prefixing each image with its batch name to avoid naming conflicts.
-    
-    Args:
-        condition_dir: Path to condition directory
-        
-    Returns:
-        Path to temporary directory containing all images
-    """
+    """Collect all images from all batches in a condition directory."""
     # Create a temporary directory for combined images
     temp_dir = condition_dir / "temp_combined_batches"
     temp_dir.mkdir(exist_ok=True)
@@ -95,133 +91,120 @@ def collect_images_from_batches(condition_dir):
     
     return temp_dir
 
-def process_condition(pipeline, condition_dir, output_dir, pbar=None):
-    """
-    Process all batches within a condition directory as a single combined batch.
-    
-    Args:
-        pipeline: Initialized CellSegmentationPipeline instance
-        condition_dir: Path to condition directory
-        output_dir: Path to save outputs
-        pbar: Optional tqdm progress bar for tracking progress
-        
-    Returns:
-        List of dictionaries containing results for all images in the condition
-    """
+def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar=None):
+    """Process all batches within a condition directory."""
     # Create output directory for this condition
-    condition_output_dir = output_dir / condition_dir.name
+    condition_output_dir = run_output_dir / condition_dir.name
     condition_output_dir.mkdir(parents=True, exist_ok=True)
     
     try:
         # Collect and combine all images from all batches
         temp_dir = collect_images_from_batches(condition_dir)
         
+        # Create a temporary pipeline without run_id to avoid nested folders
+        temp_pipeline = CellSegmentationPipeline(
+            yolo_model_path=pipeline.yolo_model.model.pt_path,
+            sam_model_type=pipeline.sam_model_type,
+            device=pipeline.device
+        )
+        
         # Process all images in the temporary directory
-        results = pipeline.process_directory(
+        batch_result = temp_pipeline.process_directory(
             input_dir=temp_dir,
             output_dir=condition_output_dir,
             save_visualizations=True,
             pbar=pbar
         )
         
-        # Add condition information
-        for result in results:
-            result['condition'] = condition_dir.name
+        # Add condition information to results
+        for result in batch_result.results:
+            result.condition = condition_dir.name
+        
+        # Save condition-specific results directly in the condition directory
+        save_results_to_csv(batch_result, condition_output_dir)
+        save_run_summary(
+            batch_result,
+            temp_dir,  # Use temp_dir as input dir for condition summary
+            condition_output_dir,
+            run_id,
+            batch_result.total_timing['total_time'],
+            summary_name=f"{condition_dir.name}_summary.txt",
+            is_condition_summary=True
+        )
             
-        return results
+        return batch_result
         
     finally:
         # Clean up temporary directory
         if temp_dir.exists():
             shutil.rmtree(temp_dir)
 
-def aggregate_results(all_results, output_dir):
-    """
-    Aggregate results across all conditions and save summary statistics.
+def combine_batch_results(batch_results):
+    """Combine multiple batch results into a single BatchProcessingResult."""
+    all_results = []
+    all_metrics = []
+    all_timing = []
+    total_timing = {
+        "image_load": 0,
+        "yolo_detection": 0,
+        "sam_preprocess": 0,
+        "sam_inference_total": 0,
+        "sam_postprocess_total": 0,
+        "metrics_total": 0,
+        "visualization": 0,
+        "total_time": 0,
+        "total_cells": 0
+    }
     
-    Args:
-        all_results: List of results from all conditions
-        output_dir: Directory to save aggregated results
-    """
-    # Prepare data for aggregation
-    metrics_data = []
-    timing_data = []
-    
-    for result in all_results:
-        # Base info for both metrics and timing
-        base_info = {
-            'condition': result['condition'],
-            'image': Path(result['image_path']).name,
-        }
+    for batch_result in batch_results:
+        all_results.extend(batch_result.results)
         
-        # Prepare timing data
-        timing_info = base_info.copy()
-        timing_info.update({
-            'num_cells': result['num_cells'],
-            'image_load_time': result['timing']['image_load'],
-            'yolo_detection_time': result['timing']['yolo_detection'],
-            'sam_preprocess_time': result['timing']['sam_preprocess'],
-            'sam_inference_time': result['timing']['sam_inference_total'],
-            'sam_postprocess_time': result['timing']['sam_postprocess_total'],
-            'metrics_calculation_time': result['timing']['metrics_total'],
-            'visualization_time': result['timing']['visualization'],
-            'total_time': result['timing']['total_time'],
-            'cells_processed': result['timing']['cells_processed']
-        })
-        timing_data.append(timing_info)
+        # Add condition information to metrics data
+        for result in batch_result.results:
+            condition = getattr(result, 'condition', 'Unknown')
+            image_name = Path(result.image_path).name
+            
+            # Update cell metrics with image and condition info
+            for cell_idx, cell_metric in enumerate(result.cell_metrics):
+                cell_metric.update({
+                    'condition': condition,
+                    'image_name': image_name,
+                    'cell_id': cell_idx
+                })
+                all_metrics.append(cell_metric)
+            
+            # Update timing data with condition info
+            timing_entry = next((t for t in batch_result.timing_data if t['image_name'] == image_name), None)
+            if timing_entry:
+                timing_entry['condition'] = condition
+                all_timing.append(timing_entry)
         
-        # Prepare metrics data
-        for i, cell_metrics in enumerate(result['cell_metrics']):
-            cell_info = base_info.copy()
-            cell_info['cell_id'] = i
-            cell_info['num_cells'] = result['num_cells']
-            cell_info.update(cell_metrics)
-            metrics_data.append(cell_info)
+        # Aggregate timing data
+        for key in total_timing:
+            total_timing[key] += batch_result.total_timing[key]
     
-    # Create and save metrics DataFrame
-    metrics_df = pd.DataFrame(metrics_data)
-    metrics_file = output_dir / 'project_cell_metrics.csv'
-    metrics_df.to_csv(metrics_file, index=False)
-    
-    # Create and save timing DataFrame
-    timing_df = pd.DataFrame(timing_data)
-    timing_file = output_dir / 'project_timing_metrics.csv'
-    timing_df.to_csv(timing_file, index=False)
-    
-    # Generate condition-wise summary for metrics
-    condition_summary = metrics_df.groupby('condition').agg({
-        'num_cells': ['mean', 'std', 'min', 'max'],
-        'cell_id': 'count'
-    }).round(2)
-    
-    # Generate condition-wise summary for timing
-    timing_summary = timing_df.groupby('condition').agg({
-        'total_time': ['mean', 'std', 'min', 'max'],
-        'cells_processed': ['sum', 'mean']
-    }).round(3)
-    
-    # Print final summary
-    print("\nProject Summary Statistics:")
-    print("=" * 50)
-    print(f"Total conditions processed: {len(metrics_df['condition'].unique())}")
-    print(f"Total images processed: {len(metrics_df['image'].unique())}")
-    print(f"Total cells detected: {len(metrics_df)}")
-    print(f"\nTiming Summary:")
-    print(f"Average processing time per image: {timing_df['total_time'].mean():.3f}s")
-    print(f"Average processing time per cell: {timing_df['total_time'].sum() / timing_df['cells_processed'].sum():.3f}s")
-    print(f"\nResults saved to:")
-    print(f"- Cell metrics: {metrics_file}")
-    print(f"- Timing metrics: {timing_file}")
-    
-    # Print condition-wise summary
-    print("\nCondition-wise Summary:")
-    print("=" * 50)
-    for condition in condition_summary.index:
-        print(f"\nCondition: {condition}")
-        print(f"Images processed: {len(timing_df[timing_df['condition'] == condition])}")
-        print(f"Total cells: {condition_summary.loc[condition, ('cell_id', 'count')]:.0f}")
-        print(f"Cells per image: {condition_summary.loc[condition, ('num_cells', 'mean')]:.1f} ± {condition_summary.loc[condition, ('num_cells', 'std')]:.1f}")
-        print(f"Processing time per image: {timing_summary.loc[condition, ('total_time', 'mean')]:.3f}s ± {timing_summary.loc[condition, ('total_time', 'std')]:.3f}s")
+    return BatchProcessingResult(
+        results=all_results,
+        total_timing=total_timing,
+        metrics_data=all_metrics,
+        timing_data=all_timing
+    )
+
+def create_run_output_dir(base_output_dir: Path) -> Tuple[Path, str]:
+    """Create a unique run output directory."""
+    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    run_dir = base_output_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir, run_id
+
+def count_total_images(condition_dirs):
+    """Count total number of images across all conditions."""
+    total_images = 0
+    for condition_dir in condition_dirs:
+        temp_dir = collect_images_from_batches(condition_dir)
+        total_images += len(list(temp_dir.glob("*.png")) + list(temp_dir.glob("*.jpg")) + list(temp_dir.glob("*.tiff")))
+        shutil.rmtree(temp_dir)
+    return total_images
 
 def main():
     try:
@@ -230,13 +213,16 @@ def main():
         
         # Convert paths to Path objects
         project_dir = Path(args.project_dir)
-        output_dir = Path(args.output_dir)
+        base_output_dir = Path(args.output_dir)
         
         # Validate project directory
         if not project_dir.exists():
             raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
         
-        print("Initializing pipeline...")
+        # Create unique run output directory
+        run_output_dir, run_id = create_run_output_dir(base_output_dir)
+        
+        print(f"Initializing pipeline... [Run ID: {run_id}]")
         # Get model path from MLflow
         yolo_model_path = load_model_from_mlflow(args.experiment_id, args.run_id)
         
@@ -247,26 +233,43 @@ def main():
             device=args.device
         )
         
-        # Get all condition directories
+        # Get all condition directories and count total images
         condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
-        
-        # Count total number of images across all conditions
-        total_images = 0
-        for condition_dir in condition_dirs:
-            temp_dir = collect_images_from_batches(condition_dir)
-            total_images += len(list(temp_dir.glob("*.png")) + list(temp_dir.glob("*.jpg")) + list(temp_dir.glob("*.tiff")))
-            shutil.rmtree(temp_dir)
+        total_images = count_total_images(condition_dirs)
         
         # Process each condition with progress bar tracking total images
-        all_results = []
+        start_time = time.time()
+        batch_results = []
         with tqdm(total=total_images, desc="Processing images", unit="image") as pbar:
             for condition_dir in condition_dirs:
-                condition_results = process_condition(pipeline, condition_dir, output_dir, pbar)
-                all_results.extend(condition_results)
+                batch_result = process_condition(
+                    pipeline=pipeline,
+                    condition_dir=condition_dir,
+                    run_output_dir=run_output_dir,
+                    run_id=run_id,
+                    pbar=pbar
+                )
+                batch_results.append(batch_result)
         
-        # Aggregate and save results
+        total_runtime = time.time() - start_time
+        
+        # Combine all results and generate run summary
         print("\nAggregating results and generating summary...")
-        aggregate_results(all_results, output_dir)
+        combined_results = combine_batch_results(batch_results)
+        
+        # Save combined run summary directly in the run output directory
+        save_results_to_csv(combined_results, run_output_dir)
+        save_run_summary(
+            combined_results,
+            project_dir,
+            run_output_dir,
+            run_id,
+            total_runtime,
+            summary_name="run_summary.txt"
+        )
+        print_summary(combined_results, total_runtime)
+        
+        print(f"\nResults saved to: {run_output_dir}")
         
     except Exception as e:
         logger.error(f"An error occurred during pipeline execution: {str(e)}", exc_info=True)
