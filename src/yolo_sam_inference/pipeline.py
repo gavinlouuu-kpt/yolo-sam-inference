@@ -17,6 +17,7 @@ import pandas as pd
 import time
 import warnings
 from .utils.image_utils import save_optimized_tiff, save_mask_as_tiff
+from tqdm import tqdm
 
 # Filter out specific warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
@@ -40,8 +41,9 @@ class CellSegmentationPipeline:
         self.device = device
         self.sam_model_type = sam_model_type
         
-        # Initialize YOLO model
+        # Initialize YOLO model with verbose=False to disable progress output
         self.yolo_model = YOLO(yolo_model_path)
+        self.yolo_model.args['verbose'] = False  # Set verbose in args dictionary
         
         # Initialize SAM model and processor from HuggingFace
         self.sam_model = SamModel.from_pretrained(sam_model_type).to(device)
@@ -54,7 +56,8 @@ class CellSegmentationPipeline:
         self,
         input_dir: Union[str, Path],
         output_dir: Union[str, Path],
-        save_visualizations: bool = True
+        save_visualizations: bool = True,
+        pbar: tqdm = None
     ) -> List[Dict[str, Any]]:
         """
         Process all images in a directory.
@@ -63,6 +66,7 @@ class CellSegmentationPipeline:
             input_dir: Directory containing input images
             output_dir: Directory to save outputs
             save_visualizations: Whether to save visualization images
+            pbar: Optional tqdm progress bar for tracking progress
             
         Returns:
             List of dictionaries containing results for each image
@@ -93,13 +97,8 @@ class CellSegmentationPipeline:
         all_metrics_data = []
         all_timing_data = []
         
-        print(f"\nProcessing {len(image_files)} images...")
-        print("=" * 80)
-        
         start_time = time.time()
-        for idx, image_path in enumerate(image_files, 1):
-            print(f"\nProcessing image {idx}/{len(image_files)}: {image_path.name}")
-            
+        for image_path in image_files:
             result = self.process_single_image(
                 image_path,
                 output_dir / image_path.name,
@@ -114,6 +113,11 @@ class CellSegmentationPipeline:
                     total_timing[key] += timing["cells_processed"]
                 elif key in timing:
                     total_timing[key] += timing[key]
+            
+            # Update progress bar if provided
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix({'cells': timing["cells_processed"]}, refresh=True)
             
             # Add timing data for this image
             all_timing_data.append({
@@ -266,7 +270,7 @@ class CellSegmentationPipeline:
         sam_postprocess_total = 0
         metrics_total = 0
         
-        for i, box in enumerate(boxes):
+        for box in boxes:
             # Process box with SAM
             box_start = time.time()
             inputs = self.sam_processor(
@@ -323,12 +327,6 @@ class CellSegmentationPipeline:
             cell_metrics.append(metrics)
             metrics_time = time.time() - metrics_start
             metrics_total += metrics_time
-            
-            # Log per-cell timing
-            print(f"Cell {i+1}/{len(boxes)} - Box process: {box_process_time*1000:.1f}ms, "
-                  f"Inference: {inference_time*1000:.1f}ms, "
-                  f"Post-process: {postprocess_time*1000:.1f}ms, "
-                  f"Metrics: {metrics_time*1000:.1f}ms")
         
         # Save visualizations if requested
         vis_time = 0
@@ -338,21 +336,6 @@ class CellSegmentationPipeline:
             vis_time = time.time() - vis_start
         
         total_time = time.time() - start_time
-        
-        # Log overall timing
-        print(f"\nPerformance Summary for {image_path}:")
-        print(f"Image load time: {image_load_time*1000:.1f}ms")
-        print(f"YOLO detection time: {yolo_time*1000:.1f}ms")
-        print(f"SAM preprocessing time: {sam_preprocess_time*1000:.1f}ms")
-        print(f"Total SAM inference time: {sam_inference_total*1000:.1f}ms")
-        print(f"Total SAM post-processing time: {sam_postprocess_total*1000:.1f}ms")
-        print(f"Total metrics calculation time: {metrics_total*1000:.1f}ms")
-        if save_visualizations:
-            print(f"Visualization save time: {vis_time*1000:.1f}ms")
-        print(f"Total cells processed: {len(boxes)}")
-        print(f"Total processing time: {total_time*1000:.1f}ms")
-        print(f"Average time per cell: {(total_time/len(boxes)*1000 if len(boxes) > 0 else 0):.1f}ms")
-        print("-" * 80)
             
         return {
             "image_path": str(image_path),
