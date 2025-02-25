@@ -19,6 +19,10 @@ import warnings
 from .utils.image_utils import save_optimized_tiff, save_mask_as_tiff
 from tqdm import tqdm
 from dataclasses import dataclass
+import logging
+
+# Set up logger
+logger = logging.getLogger(__name__)
 
 # Filter out specific warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
@@ -147,27 +151,35 @@ class CellSegmentationPipeline:
         boxes = self._detect_cells(image)
         timings['yolo_detection'] = time.time() - start_time
 
-        # Prepare SAM inputs
-        start_time = time.time()
-        sam_inputs = self.sam_processor(image, return_tensors="pt")
-        processed_pixel_values = sam_inputs['pixel_values'].to(self.device)
-        timings['sam_preprocess'] = time.time() - start_time
-
-        # Process each detected cell
+        # Initialize empty lists for results
         masks = []
         cell_metrics = []
         sam_times = {'inference': 0.0, 'postprocess': 0.0}
 
-        for box in boxes:
-            mask = self._process_sam_mask(image, box, processed_pixel_values)
-            masks.append(mask)
-            
-            metrics = calculate_metrics(image, mask)
-            cell_metrics.append(metrics)
+        # Only process with SAM if YOLO detected cells
+        if len(boxes) > 0:
+            logger.info(f"YOLO detected {len(boxes)} cells in {Path(image_path).name}")
+            # Prepare SAM inputs
+            start_time = time.time()
+            sam_inputs = self.sam_processor(image, return_tensors="pt")
+            processed_pixel_values = sam_inputs['pixel_values'].to(self.device)
+            timings['sam_preprocess'] = time.time() - start_time
+
+            # Process each detected cell
+            for box in boxes:
+                mask = self._process_sam_mask(image, box, processed_pixel_values)
+                masks.append(mask)
+                
+                metrics = calculate_metrics(image, mask)
+                cell_metrics.append(metrics)
+        else:
+            logger.info(f"No cells detected by YOLO in {Path(image_path).name} - skipping SAM processing")
+            # No cells detected, set SAM preprocessing time to 0
+            timings['sam_preprocess'] = 0.0
 
         timings.update(sam_times)
 
-        # Save visualizations if requested
+        # Save visualizations if requested and there are detections
         if save_visualizations:
             start_time = time.time()
             self._save_visualizations(image, masks, boxes, cell_metrics, output_path)
@@ -179,6 +191,9 @@ class CellSegmentationPipeline:
             'total_time': total_time,
             'cells_processed': len(boxes)
         })
+
+        # Log processing summary
+        logger.info(f"Processed {Path(image_path).name}: {len(boxes)} cells detected, total time: {total_time:.2f}s")
 
         return ProcessingResult(
             image_path=str(image_path),
