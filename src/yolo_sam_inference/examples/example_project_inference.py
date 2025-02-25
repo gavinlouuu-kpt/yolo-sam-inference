@@ -5,6 +5,7 @@
 # feature: Gate ROI of all the conditions in the beginning of the pipeline
 
 from yolo_sam_inference import CellSegmentationPipeline
+from yolo_sam_inference.pipeline import ParallelCellSegmentationPipeline
 from yolo_sam_inference.utils import (
     setup_logger,
     load_model_from_mlflow,
@@ -72,6 +73,13 @@ def parse_args():
         choices=['cuda', 'cpu'],
         default='cuda',
         help='Device to run inference on'
+    )
+    
+    parser.add_argument(
+        '--num-pipelines',
+        type=int,
+        default=2,
+        help='Number of parallel pipelines to use for processing'
     )
     
     return parser.parse_args()
@@ -345,10 +353,11 @@ def main():
         yolo_model_path = load_model_from_mlflow(args.experiment_id, args.run_id)
         
         # Initialize the pipeline
-        pipeline = CellSegmentationPipeline(
+        pipeline = ParallelCellSegmentationPipeline(
             yolo_model_path=yolo_model_path,
             sam_model_type="facebook/sam-vit-huge",
-            device=args.device
+            device=args.device,
+            num_pipelines=args.num_pipelines
         )
         
         # Process each condition with progress bar tracking total images

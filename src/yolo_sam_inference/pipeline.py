@@ -420,3 +420,172 @@ class CellSegmentationPipeline:
         except Exception as e:
             print(f"Warning: Error during visualization saving: {str(e)}")
             # Continue processing even if visualization fails 
+
+class ParallelCellSegmentationPipeline:
+    def __init__(
+        self,
+        yolo_model_path: Union[str, Path],
+        sam_model_type: str = "facebook/sam-vit-huge",
+        device: str = "cuda",
+        num_pipelines: int = 2
+    ):
+        """
+        Initialize multiple cell segmentation pipelines for parallel processing.
+        
+        Args:
+            yolo_model_path: Path to the YOLO model weights
+            sam_model_type: HuggingFace model identifier for SAM
+            device: Device to run models on ('cuda' or 'cpu')
+            num_pipelines: Number of parallel pipelines to create
+        """
+        self.device = device
+        self.sam_model_type = sam_model_type
+        self.num_pipelines = num_pipelines
+        
+        # Create multiple pipeline instances
+        self.pipelines = [
+            CellSegmentationPipeline(yolo_model_path, sam_model_type, device)
+            for _ in range(num_pipelines)
+        ]
+        
+        self.run_id = self._generate_run_id()
+    
+    @staticmethod
+    def _generate_run_id() -> str:
+        """Generate a unique run ID for this pipeline instance."""
+        return f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    
+    def process_directory(
+        self,
+        input_dir: Union[str, Path],
+        output_dir: Union[str, Path],
+        save_visualizations: bool = True,
+        pbar: Optional[tqdm] = None
+    ) -> BatchProcessingResult:
+        """
+        Process all images in a directory using multiple pipelines in parallel.
+        
+        Args:
+            input_dir: Directory containing input images
+            output_dir: Directory to save outputs
+            save_visualizations: Whether to save visualization images
+            pbar: Optional tqdm progress bar for tracking progress
+            
+        Returns:
+            BatchProcessingResult containing results for all images
+        """
+        input_dir = Path(input_dir)
+        output_dir = Path(output_dir) / self.run_id
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Get all image files
+        image_files = self._get_image_files(input_dir)
+        
+        # Split images among pipelines
+        from concurrent.futures import ThreadPoolExecutor
+        import math
+        
+        batch_size = math.ceil(len(image_files) / self.num_pipelines)
+        image_batches = [image_files[i:i + batch_size] for i in range(0, len(image_files), batch_size)]
+        
+        # Process batches in parallel
+        results = []
+        metrics_data = []
+        timing_data = []
+        total_timing = self._initialize_timing_dict()
+        
+        def process_batch(pipeline, batch):
+            batch_results = []
+            for image_path in batch:
+                result = pipeline.process_single_image(
+                    image_path,
+                    output_dir / image_path.name,
+                    save_visualizations
+                )
+                batch_results.append(result)
+                if pbar:
+                    pbar.update(1)
+            return batch_results
+        
+        with ThreadPoolExecutor(max_workers=self.num_pipelines) as executor:
+            futures = [
+                executor.submit(process_batch, pipeline, batch)
+                for pipeline, batch in zip(self.pipelines, image_batches)
+            ]
+            
+            # Collect results from all futures
+            for future in futures:
+                batch_results = future.result()
+                results.extend(batch_results)
+                
+                # Collect metrics and timing data
+                for result in batch_results:
+                    self._collect_metrics_data(metrics_data, result)
+                    self._collect_timing_data(timing_data, result)
+                    self._update_total_timing(total_timing, result.timing)
+        
+        return BatchProcessingResult(
+            results=results,
+            total_timing=total_timing,
+            metrics_data=metrics_data,
+            timing_data=timing_data
+        )
+    
+    @staticmethod
+    def _get_image_files(directory: Path) -> List[Path]:
+        """Get all image files from a directory."""
+        return list(directory.glob("*.png")) + list(directory.glob("*.jpg")) + \
+               list(directory.glob("*.tiff"))
+    
+    @staticmethod
+    def _initialize_timing_dict() -> Dict[str, float]:
+        """Initialize timing dictionary with zero values."""
+        return {
+            "image_load": 0,
+            "yolo_detection": 0,
+            "sam_preprocess": 0,
+            "sam_inference_total": 0,
+            "sam_postprocess_total": 0,
+            "metrics_total": 0,
+            "visualization": 0,
+            "total_time": 0,
+            "total_cells": 0
+        }
+    
+    @staticmethod
+    def _collect_metrics_data(
+        metrics_data: List[Dict[str, Any]],
+        result: ProcessingResult
+    ) -> None:
+        """Collect metrics data from processing result."""
+        for cell_idx, metrics in enumerate(result.cell_metrics):
+            metrics_row = {
+                'image_name': Path(result.image_path).name,
+                'cell_id': cell_idx,
+                **metrics
+            }
+            metrics_data.append(metrics_row)
+    
+    @staticmethod
+    def _collect_timing_data(
+        timing_data: List[Dict[str, Any]],
+        result: ProcessingResult
+    ) -> None:
+        """Collect timing data from processing result."""
+        timing_data.append({
+            'image_name': Path(result.image_path).name,
+            'cells_processed': result.timing["cells_processed"],
+            **{f"{k}_ms": v * 1000 for k, v in result.timing.items() if k != "cells_processed"}
+        })
+    
+    @staticmethod
+    def _update_total_timing(
+        total_timing: Dict[str, float],
+        timing: Dict[str, float]
+    ) -> None:
+        """Update total timing dictionary with new timing data."""
+        for key in total_timing:
+            if key == "total_cells":
+                total_timing[key] += timing["cells_processed"]
+            elif key in timing:
+                total_timing[key] += timing[key] 
