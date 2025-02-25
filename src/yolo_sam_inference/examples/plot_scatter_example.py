@@ -13,11 +13,12 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from bokeh.plotting import figure, show, save, output_file
-from bokeh.layouts import column
+from bokeh.layouts import column, row, gridplot
 from bokeh.models import ColumnDataSource, HoverTool
 from bokeh.palettes import Spectral11
 from bokeh.embed import file_html
 from bokeh.resources import CDN
+from scipy.stats import gaussian_kde
 import glob
 
 def find_timestamp_folder(condition_path):
@@ -43,48 +44,98 @@ def load_project_data(project_path):
     project_path = Path(project_path)
     all_data = []
     
-    # Get all condition folders
-    condition_folders = [d for d in project_path.iterdir() if d.is_dir()]
+    print("\nScanning project directory:")
+    print(f"Project path: {project_path}")
+    
+    # List all items in the project directory
+    all_items = list(project_path.iterdir())
+    print("\nAll items found in directory:")
+    for item in all_items:
+        print(f"- {item.name} ({'directory' if item.is_dir() else 'file'})")
+    
+    # Get all condition folders (excluding timestamp folders)
+    condition_folders = [d for d in all_items if d.is_dir() and not d.name.startswith('202')]
+    
+    print("\nIdentified condition folders:")
+    for folder in condition_folders:
+        print(f"- {folder.name}")
     
     for condition_folder in condition_folders:
         condition_name = condition_folder.name
         metrics_file = condition_folder / 'gated_cell_metrics.csv'
         
+        print(f"\nProcessing condition: {condition_name}")
+        print(f"Looking for metrics file: {metrics_file}")
+        
         if metrics_file.exists():
-            # Read the CSV file
-            df = pd.read_csv(metrics_file)
-            # Add condition column if not present
-            if 'condition' not in df.columns:
+            print(f"Found metrics file for {condition_name}")
+            try:
+                # Read the CSV file
+                df = pd.read_csv(metrics_file)
+                print(f"Loaded {len(df)} rows from {condition_name}")
+                
+                # Explicitly set the condition column
                 df['condition'] = condition_name
-            all_data.append(df)
+                print(f"Set condition column to: {condition_name}")
+                
+                # Verify condition column
+                unique_conditions = df['condition'].unique()
+                print(f"Verified conditions in DataFrame: {unique_conditions}")
+                
+                all_data.append(df)
+            except Exception as e:
+                print(f"Error processing {condition_name}: {str(e)}")
+        else:
+            print(f"Warning: No metrics file found for condition {condition_name}")
     
-    # Combine all dataframes
-    return pd.concat(all_data, ignore_index=True)
+    if not all_data:
+        raise ValueError("No data found in any condition folder!")
+    
+    # Combine all dataframes and verify the result
+    combined_df = pd.concat(all_data, ignore_index=True)
+    
+    # Debug information about the combined dataset
+    print(f"\nCombined dataset information:")
+    print(f"Total rows: {len(combined_df)}")
+    print("Rows per condition:")
+    for condition in combined_df['condition'].unique():
+        count = len(combined_df[combined_df['condition'] == condition])
+        print(f"- {condition}: {count} rows")
+    
+    return combined_df
 
 def get_cropped_image_base64(image_path, min_x, min_y, max_x, max_y):
     """Load and crop image, then convert to base64 for Bokeh tooltip."""
     try:
         if not os.path.exists(image_path):
-            print(f"Image not found: {image_path}")
             return None
             
-        # Open and convert TIFF to ensure proper handling
         img = Image.open(image_path)
         
-        # Print image details for debugging
-        print(f"Processing image: {image_path}")
-        print(f"Image mode: {img.mode}")
-        print(f"Image size: {img.size}")
-        
         # The coordinates in the CSV are flipped (x is y and y is x)
-        # We need to swap them back
         min_x_img = int(min_y)  # CSV's min_y becomes image's min_x
         max_x_img = int(max_y)  # CSV's max_y becomes image's max_x
         min_y_img = int(min_x)  # CSV's min_x becomes image's min_y
         max_y_img = int(max_x)  # CSV's max_x becomes image's max_y
         
-        print(f"Original CSV coordinates: x=({min_x}, {max_x}), y=({min_y}, {max_y})")
-        print(f"Swapped coordinates for image: x=({min_x_img}, {max_x_img}), y=({min_y_img}, {max_y_img})")
+        # Calculate the center of the bounding box
+        center_x = (min_x_img + max_x_img) // 2
+        center_y = (min_y_img + max_y_img) // 2
+        
+        # Calculate the size of the original bounding box
+        width = max_x_img - min_x_img
+        height = max_y_img - min_y_img
+        
+        # Expand the crop area by 2x
+        expand_factor = 2.0
+        new_width = int(width * expand_factor)
+        new_height = int(height * expand_factor)
+        
+        # Calculate new coordinates while keeping the center
+        min_x_img = center_x - (new_width // 2)
+        max_x_img = center_x + (new_width // 2)
+        min_y_img = center_y - (new_height // 2)
+        max_y_img = center_y + (new_height // 2)
         
         # Ensure coordinates are within bounds
         min_x_img = max(0, min(min_x_img, img.size[0]-1))
@@ -94,42 +145,21 @@ def get_cropped_image_base64(image_path, min_x, min_y, max_x, max_y):
         
         # Convert to RGB if needed
         if img.mode in ['I;16', 'I']:
-            # For 16-bit images, normalize to 8-bit
             img_array = np.array(img)
             img_normalized = ((img_array - img_array.min()) * (255.0 / (img_array.max() - img_array.min()))).astype(np.uint8)
             img = Image.fromarray(img_normalized, mode='L')
         
-        # Convert grayscale to RGB
         if img.mode == 'L':
             img = Image.merge('RGB', (img, img, img))
         elif img.mode != 'RGB':
             img = img.convert('RGB')
         
-        # Crop the image with swapped coordinates
+        # Crop the image with expanded coordinates
         cropped = img.crop((min_x_img, min_y_img, max_x_img, max_y_img))
-        print(f"Cropped size: {cropped.size}")
         
-        # Add padding to make the crop square if needed
-        if cropped.size[0] != cropped.size[1]:
-            max_dim = max(cropped.size)
-            padded = Image.new('RGB', (max_dim, max_dim), (128, 128, 128))
-            paste_x = (max_dim - cropped.size[0]) // 2
-            paste_y = (max_dim - cropped.size[1]) // 2
-            padded.paste(cropped, (paste_x, paste_y))
-            cropped = padded
-            print(f"Padded to square: {cropped.size}")
-        
-        # Resize if too large for tooltip - increased size
-        max_size = (400, 400)  # Increased from 200x200
+        # Resize for tooltip (larger size)
+        max_size = (600, 600)
         cropped.thumbnail(max_size, Image.Resampling.LANCZOS)
-        print(f"Final thumbnail size: {cropped.size}")
-        
-        # Debug: Save a test image to check content
-        test_output_dir = os.path.join(os.path.dirname(image_path), "debug_crops")
-        os.makedirs(test_output_dir, exist_ok=True)
-        test_output_path = os.path.join(test_output_dir, f"crop_{os.path.basename(image_path)}")
-        cropped.save(test_output_path)
-        print(f"Saved debug crop to: {test_output_path}")
         
         # Convert to base64
         import base64
@@ -137,98 +167,168 @@ def get_cropped_image_base64(image_path, min_x, min_y, max_x, max_y):
         buffer = BytesIO()
         cropped.save(buffer, format='PNG', optimize=True)
         return f"data:image/png;base64,{base64.b64encode(buffer.getvalue()).decode()}"
-    except Exception as e:
-        print(f"Error processing image {image_path}: {e}")
-        import traceback
-        traceback.print_exc()
+    except Exception:
         return None
 
 def create_scatter_plot(project_path):
-    """Create interactive scatter plot with image tooltips."""
+    """Create interactive scatter plot with image tooltips and density coloring."""
     # Load data
     df = load_project_data(project_path)
+    
+    # Print debugging information
+    print("\nData Summary:")
+    print(f"Total number of rows: {len(df)}")
+    print("\nConditions found:")
+    for condition in df['condition'].unique():
+        count = len(df[df['condition'] == condition])
+        print(f"- {condition}: {count} cells")
     
     # Create color map for conditions
     conditions = df['condition'].unique()
     color_map = dict(zip(conditions, Spectral11[:len(conditions)]))
-    df['color'] = df['condition'].map(color_map)
+    print("\nColor mapping:")
+    for condition, color in color_map.items():
+        print(f"- {condition}: {color}")
     
-    # Add cropped image data
-    df['image_data'] = df.apply(
-        lambda row: get_cropped_image_base64(
-            get_image_path(project_path, row['condition'], row['image_name']),
-            row['min_x'], row['min_y'], row['max_x'], row['max_y']
-        ),
-        axis=1
-    )
-    
-    # Remove rows where image processing failed
-    df = df[df['image_data'].notna()]
-    
-    if df.empty:
-        print("No valid data points with images found!")
-        return
-    
-    # Create ColumnDataSource for Bokeh
-    source = ColumnDataSource(df)
-    
-    # Set up the output file with a proper title
+    # Set up the output file
     output_file(os.path.join(project_path, 'scatter_plot.html'), 
                 title="Cell Metrics Analysis")
     
     # Create figure
-    p = figure(width=800, height=600, 
+    p = figure(width=800, height=600,
               title="Cell Metrics Scatter Plot",
               tools="pan,box_zoom,reset,save,wheel_zoom")
     p.xaxis.axis_label = 'Convex Hull Area'
     p.yaxis.axis_label = 'Deformability'
     
-    # Add scatter points
-    scatter = p.scatter(
-        'convex_hull_area', 'deformability',
-        size=8, alpha=0.6,
-        color='color',
-        legend_field='condition',
-        source=source
-    )
-    
-    # Configure legend
-    p.legend.title = 'Conditions'
-    p.legend.location = "top_right"
-    p.legend.click_policy = "hide"
-    
-    # Add hover tooltip with larger image and improved styling
+    # Create hover tool first (we'll use the same one for all renderers)
     hover = HoverTool(
-        renderers=[scatter],
         tooltips="""
-        <div style="background-color: rgba(255, 255, 255, 0.95); padding: 10px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1);">
-            <div style="text-align: center; margin-bottom: 10px;">
-                <img src="@image_data" style="max-width: 400px; border: 1px solid #ddd; border-radius: 4px;">
+        <div style="background-color: rgba(255, 255, 255, 0.98); padding: 15px; border-radius: 8px; box-shadow: 0 2px 15px rgba(0,0,0,0.15); max-width: 650px;">
+            <div style="text-align: center; margin-bottom: 15px;">
+                <img src="@image_data" style="max-width: 600px; width: 100%; height: auto; border: 2px solid #eee; border-radius: 8px;">
             </div>
-            <div style="margin: 5px 0;">
-                <span style="font-size: 14px; color: #666; font-weight: bold;">Condition:</span>
-                <span style="font-size: 14px;">@condition</span>
+            <div style="margin: 8px 0;">
+                <span style="font-size: 15px; color: #555; font-weight: bold;">Condition:</span>
+                <span style="font-size: 15px;">@condition</span>
             </div>
-            <div style="margin: 5px 0;">
-                <span style="font-size: 14px; color: #666; font-weight: bold;">Image:</span>
-                <span style="font-size: 14px;">@image_name</span>
+            <div style="margin: 8px 0;">
+                <span style="font-size: 15px; color: #555; font-weight: bold;">Image:</span>
+                <span style="font-size: 15px;">@image_name</span>
             </div>
-            <div style="margin: 5px 0;">
-                <span style="font-size: 14px; color: #666; font-weight: bold;">Area:</span>
-                <span style="font-size: 14px;">@convex_hull_area{0.00}</span>
+            <div style="margin: 8px 0;">
+                <span style="font-size: 15px; color: #555; font-weight: bold;">Area:</span>
+                <span style="font-size: 15px;">@convex_hull_area{0.00}</span>
             </div>
-            <div style="margin: 5px 0;">
-                <span style="font-size: 14px; color: #666; font-weight: bold;">Deformability:</span>
-                <span style="font-size: 14px;">@deformability{0.00}</span>
+            <div style="margin: 8px 0;">
+                <span style="font-size: 15px; color: #555; font-weight: bold;">Deformability:</span>
+                <span style="font-size: 15px;">@deformability{0.00}</span>
             </div>
         </div>
         """
     )
     p.add_tools(hover)
     
+    # Store all renderers to attach to hover tool
+    renderers = []
+    
+    # Plot each condition separately with density coloring
+    for condition in conditions:
+        print(f"\nProcessing condition: {condition}")
+        condition_data = df[df['condition'] == condition].copy()
+        print(f"Number of cells in condition: {len(condition_data)}")
+        
+        # Calculate 2D KDE for density coloring
+        if len(condition_data) > 5:  # Need enough points for meaningful KDE
+            x = condition_data['convex_hull_area'].values
+            y = condition_data['deformability'].values
+            xy = np.vstack([x, y])
+            
+            try:
+                kde = gaussian_kde(xy)
+                density = kde(xy)
+                
+                # Normalize density to [0.2, 0.8] range for alpha
+                min_density = density.min()
+                max_density = density.max()
+                if min_density != max_density:
+                    alpha_values = 0.2 + 0.6 * (density - min_density) / (max_density - min_density)
+                else:
+                    alpha_values = 0.6 * np.ones_like(density)
+                
+                # Add alpha values to the dataframe
+                condition_data['point_alpha'] = alpha_values
+                
+                print("Adding image data...")
+                # Add cropped image data for this condition
+                condition_data['image_data'] = condition_data.apply(
+                    lambda row: get_cropped_image_base64(
+                        get_image_path(project_path, row['condition'], row['image_name']),
+                        row['min_x'], row['min_y'], row['max_x'], row['max_y']
+                    ),
+                    axis=1
+                )
+                
+                # Remove rows where image processing failed
+                condition_data = condition_data[condition_data['image_data'].notna()]
+                print(f"Cells with valid images: {len(condition_data)}")
+                
+                if not condition_data.empty:
+                    source = ColumnDataSource(condition_data)
+                    
+                    # Add scatter points with density-based alpha from the source
+                    scatter = p.scatter(
+                        'convex_hull_area', 'deformability',
+                        size=8,
+                        color=color_map[condition],
+                        alpha='point_alpha',
+                        legend_label=condition,
+                        source=source,
+                        name=condition  # Add name for identification
+                    )
+                    renderers.append(scatter)
+                    print(f"Added scatter plot for {condition}")
+                else:
+                    print(f"Warning: No valid data points for {condition}")
+            
+            except np.linalg.LinAlgError:
+                print(f"KDE failed for {condition}, using simple scatter plot")
+                # Fallback to simple scatter plot if KDE fails
+                condition_data['point_alpha'] = 0.6
+                condition_data['image_data'] = condition_data.apply(
+                    lambda row: get_cropped_image_base64(
+                        get_image_path(project_path, row['condition'], row['image_name']),
+                        row['min_x'], row['min_y'], row['max_x'], row['max_y']
+                    ),
+                    axis=1
+                )
+                condition_data = condition_data[condition_data['image_data'].notna()]
+                if not condition_data.empty:
+                    source = ColumnDataSource(condition_data)
+                    scatter = p.scatter(
+                        'convex_hull_area', 'deformability',
+                        size=8,
+                        color=color_map[condition],
+                        alpha='point_alpha',
+                        legend_label=condition,
+                        source=source,
+                        name=condition
+                    )
+                    renderers.append(scatter)
+        else:
+            print(f"Warning: Not enough points for KDE in {condition}")
+    
+    # Update hover tool with all renderers
+    hover.renderers = renderers
+    
+    # Configure legend
+    p.legend.title = 'Conditions'
+    p.legend.location = "top_right"
+    p.legend.click_policy = "hide"
+    
     # Save the plot
     save(p)
-    print(f"Plot saved to: {os.path.join(project_path, 'scatter_plot.html')}")
+    print(f"\nPlot saved to: {os.path.join(project_path, 'scatter_plot.html')}")
 
 if __name__ == "__main__":
     import argparse
