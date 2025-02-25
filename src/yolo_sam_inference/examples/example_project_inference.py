@@ -198,12 +198,16 @@ def create_run_output_dir(base_output_dir: Path) -> Tuple[Path, str]:
     return run_dir, run_id
 
 def count_total_images(condition_dirs):
-    """Count total number of images across all conditions."""
+    """Count total number of images across all conditions without copying files."""
     total_images = 0
     for condition_dir in condition_dirs:
-        temp_dir = collect_images_from_batches(condition_dir)
-        total_images += len(list(temp_dir.glob("*.png")) + list(temp_dir.glob("*.jpg")) + list(temp_dir.glob("*.tiff")))
-        shutil.rmtree(temp_dir)
+        # Get all batch directories
+        batch_dirs = [d for d in condition_dir.iterdir() if d.is_dir()]
+        # Count images in each batch
+        for batch_dir in batch_dirs:
+            total_images += len(list(batch_dir.glob("*.png")) + 
+                              list(batch_dir.glob("*.jpg")) + 
+                              list(batch_dir.glob("*.tiff")))
     return total_images
 
 def main():

@@ -29,7 +29,7 @@ def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
     
     # Calculate circularity
     perimeter = props.perimeter
-    circularity = (2 * np.sqrt(area)) / perimeter if perimeter > 0 else 0
+    circularity = (2 * np.sqrt(np.pi * area)) / perimeter if perimeter > 0 else 0 #DO NOT CHANGE THIS
     
     # Calculate convex hull area and coordinates
     convex_hull_area = props.convex_area
