@@ -2,6 +2,8 @@
 # All the batches of a condition will be concatenated and then run through the pipeline together as a single batch.
 # To avoid images within the same condition of differnet batches having the same name, we will add the folder name as a prefix to the image name.
 
+# feature: Gate ROI of all the conditions in the beginning of the pipeline
+
 from yolo_sam_inference import CellSegmentationPipeline
 from yolo_sam_inference.utils import (
     setup_logger,
@@ -20,7 +22,10 @@ import shutil
 from tqdm import tqdm
 from datetime import datetime
 import uuid
-from typing import Tuple
+from typing import Tuple, Dict
+import cv2
+import json
+import pandas as pd
 
 # Set up logger with reduced verbosity
 logger = setup_logger(__name__)
@@ -101,15 +106,8 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
         # Collect and combine all images from all batches
         temp_dir = collect_images_from_batches(condition_dir)
         
-        # Create a temporary pipeline without run_id to avoid nested folders
-        temp_pipeline = CellSegmentationPipeline(
-            yolo_model_path=pipeline.yolo_model.model.pt_path,
-            sam_model_type=pipeline.sam_model_type,
-            device=pipeline.device
-        )
-        
         # Process all images in the temporary directory
-        batch_result = temp_pipeline.process_directory(
+        batch_result = pipeline.process_directory(
             input_dir=temp_dir,
             output_dir=condition_output_dir,
             save_visualizations=True,
@@ -210,6 +208,97 @@ def count_total_images(condition_dirs):
                               list(batch_dir.glob("*.tiff")))
     return total_images
 
+def get_roi_coordinates(image_path: Path) -> Tuple[int, int]:
+    """Get min and max X coordinates from user using OpenCV."""
+    # Read the image
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Could not read image: {image_path}")
+    
+    # Create window and set mouse callback
+    window_name = "Select ROI - Click two points for min and max X coordinates (Press 'r' to reset, 'c' to confirm)"
+    cv2.namedWindow(window_name)
+    points = []
+    
+    def mouse_callback(event, x, y, flags, param):
+        if event == cv2.EVENT_LBUTTONDOWN and len(points) < 2:
+            points.append(x)
+            # Draw vertical line at clicked point
+            img_copy = image.copy()
+            for px in points:
+                cv2.line(img_copy, (px, 0), (px, image.shape[0]), (0, 255, 0), 2)
+            cv2.imshow(window_name, img_copy)
+    
+    cv2.setMouseCallback(window_name, mouse_callback)
+    
+    while True:
+        # Show image
+        if not points:
+            cv2.imshow(window_name, image)
+        
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('r'):  # Reset points
+            points.clear()
+            cv2.imshow(window_name, image)
+        elif key == ord('c') and len(points) == 2:  # Confirm selection
+            break
+    
+    cv2.destroyAllWindows()
+    
+    return min(points), max(points)
+
+def save_roi_coordinates(coordinates: Dict[str, Tuple[int, int]], output_dir: Path) -> None:
+    """Save ROI coordinates to a JSON file."""
+    roi_file = output_dir / "roi_coordinates.json"
+    with open(roi_file, 'w') as f:
+        json.dump(coordinates, f, indent=2)
+
+def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Tuple[int, int]]) -> pd.DataFrame:
+    """Filter cell metrics based on ROI coordinates for each condition."""
+    # Create a copy of the DataFrame
+    gated_df = pd.DataFrame()
+    
+    # Print available columns for debugging
+    logger.info(f"Available columns in metrics DataFrame: {metrics_df.columns.tolist()}")
+    
+    # Check required columns exist
+    required_columns = ['condition', 'min_y', 'max_y']
+    missing_columns = [col for col in required_columns if col not in metrics_df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required columns in metrics DataFrame: {missing_columns}")
+    
+    # Filter cells for each condition
+    for condition, (min_x, max_x) in roi_coordinates.items():
+        logger.info(f"Processing condition: {condition} with ROI: min_x={min_x}, max_x={max_x}")
+        
+        condition_df = metrics_df[metrics_df['condition'] == condition]
+        if condition_df.empty:
+            logger.warning(f"No data found for condition: {condition}")
+            continue
+            
+        try:
+            # Calculate center y coordinate from bounding box (horizontal position)
+            condition_df['center_y'] = (condition_df['min_y'] + condition_df['max_y']) / 2
+            
+            # Filter based on center y coordinate (horizontal position)
+            gated_condition_df = condition_df[
+                (condition_df['center_y'] >= min_x) & 
+                (condition_df['center_y'] <= max_x)
+            ]
+            
+            # Remove the temporary center_y column
+            gated_condition_df = gated_condition_df.drop(columns=['center_y'])
+            
+            logger.info(f"Filtered {len(gated_condition_df)} cells from {len(condition_df)} for condition {condition}")
+            
+            gated_df = pd.concat([gated_df, gated_condition_df])
+            
+        except Exception as e:
+            logger.error(f"Error processing condition {condition}: {str(e)}")
+            raise
+    
+    return gated_df
+
 def main():
     try:
         # Parse command line arguments
@@ -226,7 +315,32 @@ def main():
         # Create unique run output directory
         run_output_dir, run_id = create_run_output_dir(base_output_dir)
         
-        print(f"Initializing pipeline... [Run ID: {run_id}]")
+        # Get all condition directories
+        condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
+        
+        # Get ROI coordinates for each condition
+        print("\nSelecting ROI coordinates for each condition...")
+        roi_coordinates = {}
+        for condition_dir in condition_dirs:
+            print(f"\nProcessing condition: {condition_dir.name}")
+            # Get first image from first batch in condition
+            batch_dirs = [d for d in condition_dir.iterdir() if d.is_dir()]
+            if not batch_dirs:
+                continue
+                
+            image_files = list(batch_dirs[0].glob("*.png")) + list(batch_dirs[0].glob("*.jpg")) + list(batch_dirs[0].glob("*.tiff"))
+            if not image_files:
+                continue
+                
+            print(f"Please select ROI coordinates for condition {condition_dir.name} using the first image")
+            min_x, max_x = get_roi_coordinates(image_files[0])
+            roi_coordinates[condition_dir.name] = (min_x, max_x)
+            print(f"ROI coordinates for {condition_dir.name}: min_x={min_x}, max_x={max_x}")
+        
+        # Save ROI coordinates
+        save_roi_coordinates(roi_coordinates, run_output_dir)
+        
+        print(f"\nInitializing pipeline... [Run ID: {run_id}]")
         # Get model path from MLflow
         yolo_model_path = load_model_from_mlflow(args.experiment_id, args.run_id)
         
@@ -237,13 +351,11 @@ def main():
             device=args.device
         )
         
-        # Get all condition directories and count total images
-        condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
-        total_images = count_total_images(condition_dirs)
-        
         # Process each condition with progress bar tracking total images
         start_time = time.time()
         batch_results = []
+        total_images = count_total_images(condition_dirs)
+        
         with tqdm(total=total_images, desc="Processing images", unit="image") as pbar:
             for condition_dir in condition_dirs:
                 batch_result = process_condition(
@@ -263,6 +375,40 @@ def main():
         
         # Save combined run summary directly in the run output directory
         save_results_to_csv(combined_results, run_output_dir)
+        
+        # Create gated versions of the metrics files
+        print("\nCreating gated metrics files...")
+        # Read the original metrics file
+        metrics_df = pd.read_csv(run_output_dir / 'cell_metrics.csv')
+        
+        # Debug: Print metrics file info
+        print("\nMetrics file information:")
+        print(f"Number of rows: {len(metrics_df)}")
+        print(f"Columns: {metrics_df.columns.tolist()}")
+        print("\nFirst few rows of data:")
+        print(metrics_df.head())
+        
+        # Apply ROI filtering
+        gated_metrics_df = filter_cells_by_roi(metrics_df, roi_coordinates)
+        
+        # Save gated metrics
+        gated_metrics_df.to_csv(run_output_dir / 'gated_cell_metrics.csv', index=False)
+        
+        # Create condition-specific gated files
+        for condition in roi_coordinates.keys():
+            condition_metrics = metrics_df[metrics_df['condition'] == condition]
+            gated_condition_metrics = filter_cells_by_roi(
+                condition_metrics, 
+                {condition: roi_coordinates[condition]}
+            )
+            
+            # Save condition-specific files
+            condition_dir = run_output_dir / condition
+            gated_condition_metrics.to_csv(
+                condition_dir / f'gated_cell_metrics.csv',
+                index=False
+            )
+        
         save_run_summary(
             combined_results,
             project_dir,
@@ -274,6 +420,8 @@ def main():
         print_summary(combined_results, total_runtime)
         
         print(f"\nResults saved to: {run_output_dir}")
+        print(f"ROI coordinates saved to: {run_output_dir}/roi_coordinates.json")
+        print("Gated metrics files have been created for each condition and the overall results.")
         
     except Exception as e:
         logger.error(f"An error occurred during pipeline execution: {str(e)}", exc_info=True)
