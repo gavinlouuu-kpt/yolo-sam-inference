@@ -28,6 +28,7 @@ import cv2
 import json
 import pandas as pd
 import logging
+from yolo_sam_inference.web.app import get_roi_coordinates_web
 
 # Set up logger with reduced verbosity
 logger = setup_logger(__name__)
@@ -331,27 +332,12 @@ def main():
         # Get all condition directories
         condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
         
-        # Get ROI coordinates for each condition
-        print("\nSelecting ROI coordinates for each condition...")
-        roi_coordinates = {}
-        for condition_dir in condition_dirs:
-            print(f"\nProcessing condition: {condition_dir.name}")
-            # Get first image from first batch in condition
-            batch_dirs = [d for d in condition_dir.iterdir() if d.is_dir()]
-            if not batch_dirs:
-                continue
-                
-            image_files = list(batch_dirs[0].glob("*.png")) + list(batch_dirs[0].glob("*.jpg")) + list(batch_dirs[0].glob("*.tiff"))
-            if not image_files:
-                continue
-                
-            print(f"Please select ROI coordinates for condition {condition_dir.name} using the first image")
-            min_x, max_x = get_roi_coordinates(image_files[0])
-            roi_coordinates[condition_dir.name] = (min_x, max_x)
-            print(f"ROI coordinates for {condition_dir.name}: min_x={min_x}, max_x={max_x}")
-        
-        # Save ROI coordinates
-        save_roi_coordinates(roi_coordinates, run_output_dir)
+        # Get ROI coordinates for each condition using web interface
+        print("\nOpening web interface for ROI selection...")
+        print("Please select ROI coordinates for each condition in the browser window.")
+        print("Click two points on each image to define the min and max X coordinates.")
+        roi_coordinates = get_roi_coordinates_web(condition_dirs, run_output_dir)
+        print("\nROI coordinates collected successfully!")
         
         print(f"\nInitializing pipeline... [Run ID: {run_id}]")
         # Get model path from MLflow
