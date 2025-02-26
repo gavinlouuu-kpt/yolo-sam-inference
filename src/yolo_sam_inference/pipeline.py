@@ -23,6 +23,7 @@ import logging
 
 # Set up logger
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.WARNING)  # Set pipeline logger to WARNING level
 
 # Filter out specific warnings
 warnings.filterwarnings('ignore', category=UserWarning, module='transformers')

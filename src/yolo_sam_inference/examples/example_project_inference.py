@@ -27,10 +27,15 @@ from typing import Tuple, Dict
 import cv2
 import json
 import pandas as pd
+import logging
 
 # Set up logger with reduced verbosity
 logger = setup_logger(__name__)
 logger.setLevel('INFO')
+
+# Reduce YOLO logging verbosity
+yolo_logger = logging.getLogger('ultralytics')
+yolo_logger.setLevel(logging.WARNING)
 
 def parse_args():
     """Parse command line arguments."""
@@ -355,7 +360,7 @@ def main():
         # Initialize the pipeline
         pipeline = ParallelCellSegmentationPipeline(
             yolo_model_path=yolo_model_path,
-            sam_model_type="facebook/sam-vit-huge",
+            sam_model_type="facebook/sam-vit-base",
             device=args.device,
             num_pipelines=args.num_pipelines
         )
