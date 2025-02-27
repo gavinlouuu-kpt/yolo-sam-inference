@@ -267,7 +267,7 @@ def save_roi_coordinates(coordinates: Dict[str, Tuple[int, int]], output_dir: Pa
     with open(roi_file, 'w') as f:
         json.dump(coordinates, f, indent=2)
 
-def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Tuple[int, int]]) -> pd.DataFrame:
+def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Dict[str, int]]) -> pd.DataFrame:
     """Filter cell metrics based on ROI coordinates for each condition."""
     # Create a copy of the DataFrame
     gated_df = pd.DataFrame()
@@ -282,8 +282,8 @@ def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Tup
         raise ValueError(f"Missing required columns in metrics DataFrame: {missing_columns}")
     
     # Filter cells for each condition
-    for condition, (min_x, max_x) in roi_coordinates.items():
-        logger.info(f"Processing condition: {condition} with ROI: min_x={min_x}, max_x={max_x}")
+    for condition, roi in roi_coordinates.items():
+        logger.info(f"Processing condition: {condition} with ROI: {roi}")
         
         condition_df = metrics_df[metrics_df['condition'] == condition]
         if condition_df.empty:
@@ -295,9 +295,10 @@ def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Tup
             condition_df['center_y'] = (condition_df['min_y'] + condition_df['max_y']) / 2
             
             # Filter based on center y coordinate (horizontal position)
+            # Note: For backward compatibility with the current pipeline, we only use x coordinates
             gated_condition_df = condition_df[
-                (condition_df['center_y'] >= min_x) & 
-                (condition_df['center_y'] <= max_x)
+                (condition_df['center_y'] >= roi['x_min']) & 
+                (condition_df['center_y'] <= roi['x_max'])
             ]
             
             # Remove the temporary center_y column

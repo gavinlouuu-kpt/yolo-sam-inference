@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>ROI Selection</title>
+    <style>
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        .image-container {
+            position: relative;
+            display: inline-block;
+            margin: 20px 0;
+            cursor: crosshair;
+        }
+
+        #image {
+            max-width: 100%;
+            height: auto;
+            user-select: none;
+            -webkit-user-drag: none;
+        }
+
+        .selection-box {
+            position: absolute;
+            border: 2px solid #00ff00;
+            background-color: rgba(0, 255, 0, 0.1);
+            pointer-events: none;
+        }
+
+        .preview-box {
+            position: absolute;
+            border: 2px dashed #00ff00;
+            background-color: rgba(0, 255, 0, 0.05);
+            pointer-events: none;
+        }
+
+        .button-container {
+            margin: 20px 0;
+        }
+
+        button {
+            padding: 10px 20px;
+            margin: 0 10px;
+            cursor: pointer;
+        }
+
+        .condition-info {
+            margin: 20px 0;
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .coordinates-info {
+            margin: 10px 0;
+            font-family: monospace;
+        }
+
+        .instructions {
+            margin: 10px 0;
+            padding: 10px;
+            background-color: #f0f0f0;
+            border-radius: 4px;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <div class="condition-info">
+            Condition: <span id="condition-name"></span>
+        </div>
+        <div class="instructions">
+            Click once to set the starting corner, move mouse to adjust size, click again to confirm the selection.
+        </div>
+        <div class="coordinates-info">
+            Selected ROI: <span id="coordinates"></span>
+        </div>
+        <div class="image-container">
+            <img id="image" src="" alt="Select ROI">
+        </div>
+        <div class="button-container">
+            <button onclick="resetSelection()">Reset</button>
+            <button onclick="confirmSelection()">Confirm</button>
+        </div>
+    </div>
+
+    <script>
+        let firstPoint = null;
+        let selectionBox = null;
+        let previewBox = null;
+        let currentBox = null;
+        let confirmedBoxes = [];
+        const imageContainer = document.querySelector('.image-container');
+        const image = document.getElementById('image');
+        const coordsDisplay = document.getElementById('coordinates');
+
+        // Prevent image dragging
+        image.addEventListener('dragstart', function (e) {
+            e.preventDefault();
+        });
+
+        // Update condition name and image source
+        const conditionName = new URLSearchParams(window.location.search).get('condition');
+        document.getElementById('condition-name').textContent = conditionName;
+        document.getElementById('image').src = `/image?condition=${conditionName}`;
+
+        function getScaledCoordinates(clientX, clientY) {
+            const rect = image.getBoundingClientRect();
+            const xRatio = (clientX - rect.left) / rect.width;
+            const yRatio = (clientY - rect.top) / rect.height;
+            return {
+                x: Math.round(xRatio * image.naturalWidth),
+                y: Math.round(yRatio * image.naturalHeight)
+            };
+        }
+
+        function updateCoordinatesDisplay(box) {
+            if (!box) {
+                coordsDisplay.textContent = 'No selection';
+                return;
+            }
+            coordsDisplay.textContent = `X: ${box.x_min} to ${box.x_max}, Y: ${box.y_min} to ${box.y_max}`;
+        }
+
+        function createBox(point1, point2, isPreview = false) {
+            const rect = image.getBoundingClientRect();
+            const box = {
+                x_min: Math.min(point1.x, point2.x),
+                x_max: Math.max(point1.x, point2.x),
+                y_min: Math.min(point1.y, point2.y),
+                y_max: Math.max(point1.y, point2.y)
+            };
+
+            const left = box.x_min / image.naturalWidth * rect.width;
+            const top = box.y_min / image.naturalHeight * rect.height;
+            const width = (box.x_max - box.x_min) / image.naturalWidth * rect.width;
+            const height = (box.y_max - box.y_min) / image.naturalHeight * rect.height;
+
+            const boxElement = document.createElement('div');
+            boxElement.className = isPreview ? 'preview-box' : 'selection-box';
+            boxElement.style.left = left + 'px';
+            boxElement.style.top = top + 'px';
+            boxElement.style.width = width + 'px';
+            boxElement.style.height = height + 'px';
+
+            return { element: boxElement, coordinates: box };
+        }
+
+        image.addEventListener('mousemove', function (e) {
+            if (firstPoint) {
+                const currentPoint = getScaledCoordinates(e.clientX, e.clientY);
+                if (previewBox) {
+                    previewBox.element.remove();
+                }
+                const { element, coordinates } = createBox(firstPoint, currentPoint, true);
+                previewBox = { element, coordinates };
+                imageContainer.appendChild(element);
+                updateCoordinatesDisplay(coordinates);
+            }
+        });
+
+        image.addEventListener('click', function (e) {
+            const coords = getScaledCoordinates(e.clientX, e.clientY);
+
+            if (!firstPoint) {
+                // First click
+                firstPoint = coords;
+                if (selectionBox) {
+                    selectionBox.element.remove();
+                }
+            } else {
+                // Second click
+                if (previewBox) {
+                    previewBox.element.remove();
+                }
+                const { element, coordinates } = createBox(firstPoint, coords);
+                if (selectionBox) {
+                    selectionBox.element.remove();
+                }
+                selectionBox = { element, coordinates };
+                imageContainer.appendChild(element);
+                currentBox = coordinates;
+                updateCoordinatesDisplay(currentBox);
+                firstPoint = null;
+            }
+        });
+
+        function resetSelection() {
+            if (selectionBox) {
+                selectionBox.element.remove();
+                selectionBox = null;
+            }
+            if (previewBox) {
+                previewBox.element.remove();
+                previewBox = null;
+            }
+            firstPoint = null;
+            currentBox = null;
+            updateCoordinatesDisplay(null);
+        }
+
+        function confirmSelection() {
+            if (!currentBox) {
+                alert('Please select a region first');
+                return;
+            }
+
+            // Keep the current box visible
+            if (selectionBox) {
+                confirmedBoxes.push(selectionBox);
+            }
+
+            fetch('/confirm_roi', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    condition: conditionName,
+                    x_min: currentBox.x_min,
+                    x_max: currentBox.x_max,
+                    y_min: currentBox.y_min,
+                    y_max: currentBox.y_max
+                })
+            }).then(response => response.json())
+                .then(data => {
+                    if (data.next_condition) {
+                        window.location.href = `/select_roi?condition=${data.next_condition}`;
+                    } else {
+                        alert('All conditions processed! You can close this window.');
+                        window.close();
+                    }
+                });
+        }
+    </script>
+</body>
+
+</html>
