@@ -49,8 +49,7 @@ class CellSegmentationPipeline:
         self,
         yolo_model_path: Union[str, Path],
         sam_model_type: str = "facebook/sam-vit-huge",
-        device: str = "cuda",
-        prompt_type: str = "box"
+        device: str = "cuda"
     ):
         """
         Initialize the cell segmentation pipeline.
@@ -60,11 +59,9 @@ class CellSegmentationPipeline:
             sam_model_type: HuggingFace model identifier for SAM
                           (e.g., 'facebook/sam-vit-huge', 'facebook/sam-vit-large', 'facebook/sam-vit-base')
             device: Device to run models on ('cuda' or 'cpu')
-            prompt_type: Type of prompt to use for SAM ('box' or 'point')
         """
         self.device = device
         self.sam_model_type = sam_model_type
-        self.prompt_type = prompt_type
         
         self._initialize_models(yolo_model_path)
         self.run_id = self._generate_run_id()
@@ -94,48 +91,23 @@ class CellSegmentationPipeline:
         image: np.ndarray,
         box: np.ndarray,
         processed_pixel_values: torch.Tensor
-    ) -> np.ndarray:
+    ) -> Tuple[np.ndarray, float, float]:
         """Process a single box with SAM model."""
-        if self.prompt_type == "box":
-            # Use box prompt
-            inputs = self.sam_processor(
-                image,
-                input_boxes=[[box.tolist()]],
-                return_tensors="pt"
+        # Prepare inputs
+        inputs = self.sam_processor(
+            image,
+            input_boxes=[[box.tolist()]],
+            return_tensors="pt"
+        )
+        processed_boxes = inputs['input_boxes'].to(self.device)
+
+        # Generate mask prediction
+        with torch.no_grad():
+            outputs = self.sam_model(
+                pixel_values=processed_pixel_values,
+                input_boxes=processed_boxes,
+                multimask_output=False,
             )
-            processed_boxes = inputs['input_boxes'].to(self.device)
-            
-            # Generate mask prediction
-            with torch.no_grad():
-                outputs = self.sam_model(
-                    pixel_values=processed_pixel_values,
-                    input_boxes=processed_boxes,
-                    multimask_output=False,
-                )
-        else:  # point prompt
-            # Calculate center point from box
-            x1, y1, x2, y2 = box
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-            
-            # Use point prompt with label 1 (foreground point)
-            inputs = self.sam_processor(
-                image,
-                input_points=[[[center_x, center_y]]],
-                input_labels=[[1]],  # 1 indicates foreground point
-                return_tensors="pt"
-            )
-            processed_points = inputs['input_points'].to(self.device)
-            processed_labels = inputs['input_labels'].to(self.device)
-            
-            # Generate mask prediction
-            with torch.no_grad():
-                outputs = self.sam_model(
-                    pixel_values=processed_pixel_values,
-                    input_points=processed_points,
-                    input_labels=processed_labels,
-                    multimask_output=False,
-                )
 
         # Post-process masks
         processed_masks = self.sam_processor.post_process_masks(
@@ -471,8 +443,7 @@ class ParallelCellSegmentationPipeline:
         yolo_model_path: Union[str, Path],
         sam_model_type: str = "facebook/sam-vit-huge",
         device: str = "cuda",
-        num_pipelines: int = 2,
-        prompt_type: str = "box"
+        num_pipelines: int = 2
     ):
         """
         Initialize multiple cell segmentation pipelines for parallel processing.
@@ -482,21 +453,14 @@ class ParallelCellSegmentationPipeline:
             sam_model_type: HuggingFace model identifier for SAM
             device: Device to run models on ('cuda' or 'cpu')
             num_pipelines: Number of parallel pipelines to create
-            prompt_type: Type of prompt to use for SAM ('box' or 'point')
         """
         self.device = device
         self.sam_model_type = sam_model_type
         self.num_pipelines = num_pipelines
-        self.prompt_type = prompt_type
         
         # Create multiple pipeline instances
         self.pipelines = [
-            CellSegmentationPipeline(
-                yolo_model_path,
-                sam_model_type,
-                device,
-                prompt_type
-            )
+            CellSegmentationPipeline(yolo_model_path, sam_model_type, device)
             for _ in range(num_pipelines)
         ]
         

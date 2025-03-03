@@ -88,14 +88,6 @@ def parse_args():
         help='Number of parallel pipelines to use for processing'
     )
     
-    parser.add_argument(
-        '--prompt-type',
-        type=str,
-        choices=['box', 'point'],
-        default='box',
-        help='Type of prompt to use for SAM (box: use bounding box, point: use center point)'
-    )
-    
     return parser.parse_args()
 
 def collect_image_paths_from_batches(condition_dir):
@@ -390,8 +382,7 @@ def main():
             yolo_model_path=yolo_model_path,
             sam_model_type="facebook/sam-vit-base",
             device=args.device,
-            num_pipelines=args.num_pipelines,
-            prompt_type=args.prompt_type
+            num_pipelines=args.num_pipelines
         )
         
         # Process each condition with progress bar tracking total images
