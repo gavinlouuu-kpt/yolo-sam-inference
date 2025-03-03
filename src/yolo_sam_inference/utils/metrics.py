@@ -1,12 +1,7 @@
 import numpy as np
-from skimage import measure, draw
+from skimage import measure
 from typing import Dict, Any
 from scipy.spatial import ConvexHull
-import logging
-from scipy import ndimage
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
     """Calculate various metrics for a segmented cell.
@@ -31,70 +26,47 @@ def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
 
     # Get mask contours and calculate convex hull
     contours = measure.find_contours(mask.astype(int), 0.5)
-    logger.info(f"Found {len(contours)} contours")
-    
     if len(contours) > 0:
         # Use the largest contour
         contour = contours[0]
-        logger.info(f"Contour shape: {contour.shape}")
         try:
             hull = ConvexHull(contour)
             # Get the vertices of the convex hull in order
             convex_hull_coords = contour[hull.vertices]
-            
-            # Create convex hull mask using draw.polygon
-            r = convex_hull_coords[:, 0]
-            c = convex_hull_coords[:, 1]
-            
-            # Create the initial polygon
-            rr, cc = draw.polygon(r, c, mask.shape)
+            # Add the first point at the end to close the polygon
+            convex_hull_coords = np.vstack((convex_hull_coords, convex_hull_coords[0]))
+            # Create convex hull mask
             convex_hull_mask = np.zeros_like(mask, dtype=bool)
+            rr, cc = measure.polygon(convex_hull_coords[:, 0], convex_hull_coords[:, 1], convex_hull_mask.shape)
             convex_hull_mask[rr, cc] = True
-            
-            # Fill holes in the polygon
-            convex_hull_mask = ndimage.binary_fill_holes(convex_hull_mask)
-            
             # Calculate convex hull properties
-            convex_props = measure.regionprops(convex_hull_mask.astype(int))
-            
-            if len(convex_props) > 0:
-                convex_props = convex_props[0]
-                # Calculate convex hull area and perimeter
-                convex_hull_area = convex_props.area
-                convex_hull_perimeter = convex_props.perimeter
-                logger.info(f"Convex hull metrics - Area: {convex_hull_area}, Perimeter: {convex_hull_perimeter}")
-                
-                # Calculate circularity using convex hull measurements
-                circularity = (2 * np.sqrt(np.pi * convex_hull_area)) / convex_hull_perimeter if convex_hull_perimeter > 0 else 0
-            else:
-                logger.warning("No region properties found for convex hull mask")
-                convex_hull_area = 0
-                convex_hull_perimeter = 0
-                circularity = 0
+            convex_props = measure.regionprops(convex_hull_mask.astype(int))[0]
         except Exception:
             # If convex hull calculation fails, use empty array and set properties to 0
             convex_hull_coords = np.array([])
             convex_props = None
-            convex_hull_area = 0
-            convex_hull_perimeter = 0
-            circularity = 0
     else:
         convex_hull_coords = np.array([])
         convex_props = None
-        convex_hull_area = 0
-        convex_hull_perimeter = 0
-        circularity = 0
 
     # Calculate area
     area = props.area
     
-    # Calculate perimeter
+    # Calculate circularity
     perimeter = props.perimeter
+
+    # Calculate convex hull perimeter
+    convex_hull_perimeter = convex_props.perimeter if convex_props else 0
+
+    circularity = (2 * np.sqrt(np.pi * convex_hull_area)) / convex_hull_perimeter if convex_hull_perimeter > 0 else 0 #DO NOT CHANGE THIS, USE AREA FROM CONVEX HULL
+    
+    # Calculate convex hull area and coordinates
+    convex_hull_area = convex_props.area if convex_props else 0
     
     area_ratio = convex_hull_area / area if area > 0 else 0
     
     # Calculate deformability 
-    deformability = 1 - circularity
+    deformability = 1 - circularity 
     
     # Calculate brightness metrics (convert RGB to grayscale)
     brightness_image = np.mean(image, axis=2)  # Shape will be (H, W)

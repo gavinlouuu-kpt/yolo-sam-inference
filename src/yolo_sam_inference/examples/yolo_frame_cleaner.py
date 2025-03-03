@@ -93,27 +93,19 @@ def get_roi_coordinates(image_path: Path) -> Tuple[int, int, int, int]:
     
     return roi  # Returns (x_min, y_min, width, height)
 
-def setup_output_dirs(output_base: Path) -> Tuple[Path, Path, Path, Path]:
+def setup_output_dirs(output_base: Path) -> Tuple[Path, Path]:
     """Create and return output directory paths.
     
     Returns:
-        Tuple[Path, Path, Path, Path]: Paths to full frames and cropped frames directories
-                                     (original format and PNG format)
+        Tuple[Path, Path]: Paths to full frames and cropped frames directories
     """
-    # Original format directories
     full_frames_dir = output_base / "full_frames_with_target"
     cropped_frames_dir = output_base / "cropped_roi_with_target"
     
-    # PNG format directories
-    full_frames_png_dir = output_base / "full_frames_with_target_png"
-    cropped_frames_png_dir = output_base / "cropped_roi_with_target_png"
+    full_frames_dir.mkdir(parents=True, exist_ok=True)
+    cropped_frames_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create all directories
-    for dir_path in [full_frames_dir, cropped_frames_dir, 
-                    full_frames_png_dir, cropped_frames_png_dir]:
-        dir_path.mkdir(parents=True, exist_ok=True)
-    
-    return full_frames_dir, cropped_frames_dir, full_frames_png_dir, cropped_frames_png_dir
+    return full_frames_dir, cropped_frames_dir
 
 def draw_detections(image: np.ndarray, results) -> np.ndarray:
     """Draw YOLO detections on the image.
@@ -178,7 +170,7 @@ def process_frames(
         roi_coords: (x_min, y_min, width, height) of selected ROI
     """
     # Get output directories
-    full_frames_dir, cropped_frames_dir, full_frames_png_dir, cropped_frames_png_dir = setup_output_dirs(output_dir)
+    full_frames_dir, cropped_frames_dir = setup_output_dirs(output_dir)
     
     # Create directory for debug visualizations
     debug_dir = output_dir / "debug_visualizations"
@@ -291,16 +283,12 @@ def process_frames(
         for img_path, full_frame, roi in tqdm(frames_with_target, desc="Saving target frames", unit="frame"):
             # Keep original name and append suffix
             output_name = f"{img_path.stem}_with_target{img_path.suffix}"
-            output_name_png = f"{img_path.stem}_with_target.png"
             
-            # Save full frame (original format)
+            # Save full frame
             cv2.imwrite(str(full_frames_dir / output_name), full_frame)
-            # Save cropped ROI (original format)
-            cv2.imwrite(str(cropped_frames_dir / output_name), roi)
             
-            # Save PNG versions
-            cv2.imwrite(str(full_frames_png_dir / output_name_png), full_frame)
-            cv2.imwrite(str(cropped_frames_png_dir / output_name_png), roi)
+            # Save cropped ROI
+            cv2.imwrite(str(cropped_frames_dir / output_name), roi)
     
     # Save one background frame (without target) if available
     if frames_without_target:
@@ -308,16 +296,12 @@ def process_frames(
         bg_path, bg_frame, bg_roi = frames_without_target[0]
         # Keep original name and append suffix
         bg_name = f"{bg_path.stem}_background{bg_path.suffix}"
-        bg_name_png = f"{bg_path.stem}_background.png"
         
-        # Save full background frame (original format)
+        # Save full background frame
         cv2.imwrite(str(full_frames_dir / bg_name), bg_frame)
-        # Save cropped background ROI (original format)
-        cv2.imwrite(str(cropped_frames_dir / bg_name), bg_roi)
         
-        # Save PNG versions
-        cv2.imwrite(str(full_frames_png_dir / bg_name_png), bg_frame)
-        cv2.imwrite(str(cropped_frames_png_dir / bg_name_png), bg_roi)
+        # Save cropped background ROI
+        cv2.imwrite(str(cropped_frames_dir / bg_name), bg_roi)
         
         logger.info(f"Saved background frame (from {len(frames_without_target)} available frames without targets)")
     else:
@@ -358,7 +342,7 @@ def main():
     roi_coords = get_roi_coordinates(image_files[0])
     
     # Setup output directories
-    full_frames_dir, cropped_frames_dir, full_frames_png_dir, cropped_frames_png_dir = setup_output_dirs(output_dir)
+    full_frames_dir, cropped_frames_dir = setup_output_dirs(output_dir)
     
     # Process frames
     logger.info("Processing frames...")
