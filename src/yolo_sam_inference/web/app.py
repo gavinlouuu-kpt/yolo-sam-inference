@@ -139,13 +139,14 @@ def get_roi_coordinates_web(
     
     # Initialize conditions and first images
     for condition_dir in condition_dirs:
-        batch_dirs = [d for d in condition_dir.iterdir() if d.is_dir()]
-        if not batch_dirs:
-            continue
-            
-        image_files = list(batch_dirs[0].glob("*.png")) + \
-                     list(batch_dirs[0].glob("*.jpg")) + \
-                     list(batch_dirs[0].glob("*.tiff"))
+        # Look for images directly in condition directory
+        image_files = []
+        for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+            image_files.extend(list(condition_dir.glob(f"*{ext}")))
+        
+        # Filter out background image
+        image_files = [f for f in image_files if 'background' not in f.name.lower()]
+        
         if not image_files:
             continue
             
