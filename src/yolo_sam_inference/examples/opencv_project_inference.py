@@ -69,7 +69,7 @@ class OpenCVPipeline:
         # Pre-processing
         pre_processing_start = time.perf_counter()
         blurred = cv2.GaussianBlur(image, self.blur_kernel_size, self.blur_sigma)
-        bg_sub = cv2.subtract(blurred_bg, blurred)
+        bg_sub = cv2.subtract(blurred, blurred_bg) #subtract background from target
         _, binary = cv2.threshold(bg_sub, self.threshold_value, 255, cv2.THRESH_BINARY)
         
         # Morphological operations
@@ -267,7 +267,7 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
                     
                     # Save visualization
                     vis_path = condition_output_dir / f"{image_path.stem}_result.png"
-                    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+                    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
                     
                     # Plot original image with ROI rectangle
                     ax1.imshow(image, cmap='gray')
@@ -278,10 +278,15 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
                     ax1.set_title('Original Image with ROI')
                     ax1.axis('off')
                     
-                    # Plot filtered mask
-                    ax2.imshow(filtered_mask, cmap='gray')
-                    ax2.set_title('OpenCV Mask (ROI filtered)')
+                    # Plot raw OpenCV mask before filtering
+                    ax2.imshow(mask, cmap='gray')
+                    ax2.set_title('Raw OpenCV Mask')
                     ax2.axis('off')
+                    
+                    # Plot filtered mask
+                    ax3.imshow(filtered_mask, cmap='gray')
+                    ax3.set_title('ROI Filtered Mask')
+                    ax3.axis('off')
                     
                     plt.suptitle(f"Processing Times: Pre={times['pre_processing_time']:.2f}ms, "
                                f"Contours={times['find_contours_time']:.2f}ms, "
