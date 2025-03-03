@@ -90,44 +90,23 @@ def parse_args():
     
     return parser.parse_args()
 
-def collect_image_paths_from_batches(condition_dir):
-    """Collect all image paths and their corresponding new names from all batches in a condition directory."""
-    image_mapping = {}
+def collect_images_from_batches(condition_dir):
+    """Collect all images from all batches in a condition directory."""
+    # Create a temporary directory for combined images
+    temp_dir = condition_dir / "temp_combined_batches"
+    temp_dir.mkdir(exist_ok=True)
     
     # Get all batch directories
     batch_dirs = [d for d in condition_dir.iterdir() if d.is_dir() and d.name != "temp_combined_batches"]
     
-    # Collect image paths from each batch with batch name prefix
+    # Copy images from each batch with batch name prefix
     for batch_dir in batch_dirs:
         image_files = list(batch_dir.glob("*.png")) + list(batch_dir.glob("*.jpg")) + list(batch_dir.glob("*.tiff"))
         for image_file in image_files:
             # Create new filename with batch prefix
             new_filename = f"{batch_dir.name}_{image_file.name}"
-            image_mapping[str(image_file)] = {
-                'original_path': image_file,
-                'new_name': new_filename
-            }
-    
-    return image_mapping
-
-def create_hardlinks_for_batch(condition_dir, image_mapping):
-    """Create a temporary directory with hardlinks to the original images."""
-    import os
-    
-    # Create a temporary directory for combined images
-    temp_dir = condition_dir / "temp_combined_batches"
-    temp_dir.mkdir(exist_ok=True)
-    
-    # Create hardlinks for each image
-    for original_path, info in image_mapping.items():
-        target_path = temp_dir / info['new_name']
-        if not target_path.exists():  # Only create if doesn't exist
-            try:
-                os.link(original_path, str(target_path))
-            except OSError as e:
-                # If hardlink fails (e.g., cross-device), fall back to copy
-                logger.warning(f"Failed to create hardlink, falling back to copy: {str(e)}")
-                shutil.copy2(original_path, target_path)
+            # Copy the file to temp directory
+            shutil.copy2(image_file, temp_dir / new_filename)
     
     return temp_dir
 
@@ -138,11 +117,8 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
     condition_output_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        # Get image paths and their new names
-        image_mapping = collect_image_paths_from_batches(condition_dir)
-        
-        # Create hardlinks in temporary directory
-        temp_dir = create_hardlinks_for_batch(condition_dir, image_mapping)
+        # Collect and combine all images from all batches
+        temp_dir = collect_images_from_batches(condition_dir)
         
         # Process all images in the temporary directory
         batch_result = pipeline.process_directory(
@@ -160,7 +136,7 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
         save_results_to_csv(batch_result, condition_output_dir)
         save_run_summary(
             batch_result,
-            condition_dir,  # Use condition_dir as input dir for condition summary
+            temp_dir,  # Use temp_dir as input dir for condition summary
             condition_output_dir,
             run_id,
             batch_result.total_timing['total_time'],
@@ -170,12 +146,9 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
             
         return batch_result
         
-    except Exception as e:
-        logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
-        raise
     finally:
         # Clean up temporary directory
-        if 'temp_dir' in locals() and temp_dir.exists():
+        if temp_dir.exists():
             shutil.rmtree(temp_dir)
 
 def combine_batch_results(batch_results):
@@ -294,7 +267,7 @@ def save_roi_coordinates(coordinates: Dict[str, Tuple[int, int]], output_dir: Pa
     with open(roi_file, 'w') as f:
         json.dump(coordinates, f, indent=2)
 
-def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Dict]) -> pd.DataFrame:
+def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Dict[str, int]]) -> pd.DataFrame:
     """Filter cell metrics based on ROI coordinates for each condition."""
     # Create a copy of the DataFrame
     gated_df = pd.DataFrame()
@@ -309,15 +282,8 @@ def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Dic
         raise ValueError(f"Missing required columns in metrics DataFrame: {missing_columns}")
     
     # Filter cells for each condition
-    for condition, roi_data in roi_coordinates.items():
-        logger.info(f"Processing condition: {condition} with ROI data: {roi_data}")
-        
-        # Extract coordinates from roi_data
-        if isinstance(roi_data, dict) and 'coordinates' in roi_data:
-            min_x, max_x = roi_data['coordinates']
-        else:
-            logger.warning(f"Invalid ROI data format for condition {condition}. Skipping.")
-            continue
+    for condition, roi in roi_coordinates.items():
+        logger.info(f"Processing condition: {condition} with ROI: {roi}")
         
         condition_df = metrics_df[metrics_df['condition'] == condition]
         if condition_df.empty:
@@ -329,9 +295,10 @@ def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Dic
             condition_df['center_y'] = (condition_df['min_y'] + condition_df['max_y']) / 2
             
             # Filter based on center y coordinate (horizontal position)
+            # Note: For backward compatibility with the current pipeline, we only use x coordinates
             gated_condition_df = condition_df[
-                (condition_df['center_y'] >= min_x) & 
-                (condition_df['center_y'] <= max_x)
+                (condition_df['center_y'] >= roi['x_min']) & 
+                (condition_df['center_y'] <= roi['x_max'])
             ]
             
             # Remove the temporary center_y column

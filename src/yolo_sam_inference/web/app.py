@@ -6,10 +6,6 @@ import threading
 import time
 from typing import Dict, Tuple, List
 import mimetypes
-from PIL import Image
-import io
-import numpy as np
-import tifffile
 
 app = Flask(__name__)
 
@@ -45,48 +41,17 @@ def get_image():
     
     image_path = first_images[condition]
     try:
-        # Check if the file is a TIFF
-        if image_path.suffix.lower() in ['.tiff', '.tif']:
-            # Read TIFF file
-            img_array = tifffile.imread(str(image_path))
-            
-            # Convert to 8-bit if needed
-            if img_array.dtype != np.uint8:
-                if img_array.dtype == np.bool_:
-                    img_array = img_array.astype(np.uint8) * 255
-                else:
-                    img_array = ((img_array - img_array.min()) * (255.0 / (img_array.max() - img_array.min()))).astype(np.uint8)
-            
-            # Convert to PIL Image
-            img = Image.fromarray(img_array)
-            
-            # Convert to RGB if needed
-            if img.mode not in ['RGB', 'RGBA']:
-                img = img.convert('RGB')
-            
-            # Save as PNG in memory
-            img_byte_arr = io.BytesIO()
-            img.save(img_byte_arr, format='PNG')
-            img_byte_arr.seek(0)
-            
-            return send_file(
-                img_byte_arr,
-                mimetype='image/png',
-                as_attachment=False,
-                download_name=f"{image_path.stem}.png"
-            )
-        else:
-            # For non-TIFF images, serve directly
-            mime_type = mimetypes.guess_type(image_path)[0]
-            if mime_type is None:
-                mime_type = 'application/octet-stream'
-            
-            return send_file(
-                str(image_path),
-                mimetype=mime_type,
-                as_attachment=False,
-                download_name=image_path.name
-            )
+        # Get the MIME type based on file extension
+        mime_type = mimetypes.guess_type(image_path)[0]
+        if mime_type is None:
+            mime_type = 'application/octet-stream'
+        
+        return send_file(
+            str(image_path),
+            mimetype=mime_type,
+            as_attachment=False,
+            download_name=image_path.name
+        )
     except Exception as e:
         print(f"Error serving image: {str(e)}")
         return f"Error serving image: {str(e)}", 500
