@@ -5,7 +5,7 @@ from scipy.spatial import ConvexHull
 import logging
 from scipy import ndimage
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
@@ -31,12 +31,10 @@ def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
 
     # Get mask contours and calculate convex hull
     contours = measure.find_contours(mask.astype(int), 0.5)
-    logger.info(f"Found {len(contours)} contours")
     
     if len(contours) > 0:
         # Use the largest contour
         contour = contours[0]
-        logger.info(f"Contour shape: {contour.shape}")
         try:
             hull = ConvexHull(contour)
             # Get the vertices of the convex hull in order
