@@ -9,6 +9,7 @@ from yolo_sam_inference.pipeline import ParallelCellSegmentationPipeline
 from yolo_sam_inference.utils import (
     setup_logger,
     load_model_from_mlflow,
+    load_model_from_registry,
 )
 from yolo_sam_inference.reporting import (
     save_results_to_csv,
@@ -59,18 +60,63 @@ def parse_args():
         help='Directory to save output results'
     )
     
+    # Add new arguments for model registry
+    parser.add_argument(
+        '--model-name',
+        type=str,
+        required=False,
+        help='Name of the registered model in MLflow Model Registry'
+    )
+    
+    parser.add_argument(
+        '--model-version',
+        type=str,
+        required=False,
+        help='Version of the registered model (if not specified, latest version will be used)'
+    )
+    
+    parser.add_argument(
+        '--registry-uri',
+        type=str,
+        default='http://localhost:5000',
+        help='URI of the MLflow Model Registry server'
+    )
+    
+    # Add S3/MinIO credentials
+    parser.add_argument(
+        '--aws-access-key-id',
+        type=str,
+        default='mibadmin',
+        help='AWS access key ID for S3/MinIO'
+    )
+    
+    parser.add_argument(
+        '--aws-secret-access-key',
+        type=str,
+        default='cuhkminio',
+        help='AWS secret access key for S3/MinIO'
+    )
+    
+    parser.add_argument(
+        '--s3-endpoint-url',
+        type=str,
+        default='http://localhost:9000',
+        help='S3/MinIO endpoint URL'
+    )
+    
+    # Keep the existing arguments for backward compatibility
     parser.add_argument(
         '--experiment-id',
         type=str,
         default="320489803004134590",
-        help='MLflow experiment ID'
+        help='MLflow experiment ID (used only if model-name is not provided)'
     )
     
     parser.add_argument(
         '--run-id',
         type=str,
         default="c2fef8a01dea4fc4a8876414a90b3f69",
-        help='MLflow run ID'
+        help='MLflow run ID (used only if model-name is not provided)'
     )
     
     parser.add_argument(
@@ -342,7 +388,19 @@ def main():
         
         print(f"\nInitializing pipeline... [Run ID: {run_id}]")
         # Get model path from MLflow
-        yolo_model_path = load_model_from_mlflow(args.experiment_id, args.run_id)
+        if args.model_name:
+            # Use the new registry-based model loading
+            yolo_model_path = load_model_from_registry(
+                model_name=args.model_name,
+                model_version=args.model_version,
+                registry_uri=args.registry_uri,
+                aws_access_key_id=args.aws_access_key_id,
+                aws_secret_access_key=args.aws_secret_access_key,
+                s3_endpoint_url=args.s3_endpoint_url
+            )
+        else:
+            # Fallback to the old method for backward compatibility
+            yolo_model_path = load_model_from_mlflow(args.experiment_id, args.run_id)
         
         # Initialize the pipeline
         pipeline = ParallelCellSegmentationPipeline(

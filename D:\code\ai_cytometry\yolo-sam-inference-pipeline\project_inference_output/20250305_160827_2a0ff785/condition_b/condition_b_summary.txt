@@ -1,0 +1,29 @@
+Condition Summary: condition_b
+==============================
+
+Run ID: 20250305_160827_2a0ff785
+Timestamp: 2025-03-05 16:09:57
+Input Directory: /home/mib-p5-a5000/code/ai-cyto/yolo-sam-inference/src/yolo_sam_inference/examples/example_project/condition_b/temp_combined_batches
+Output Directory: /home/mib-p5-a5000/code/ai-cyto/yolo-sam-inference/D:\code\ai_cytometry\yolo-sam-inference-pipeline\project_inference_output/20250305_160827_2a0ff785/condition_b
+
+Processing Statistics
+====================
+Total images processed: 63
+Total cells detected: 75
+Average cells per image: 1.2
+
+Timing Statistics (averaged per image)
+===================================
+Image loading: 2.1ms
+YOLO detection: 26.6ms
+SAM preprocessing: 18.8ms
+SAM inference: 0.0ms
+SAM postprocessing: 0.0ms
+Metrics calculation: 0.0ms
+Visualization: 68.8ms
+
+Overall Performance
+==================
+Total runtime: 4.3s
+Average time per image: 0.1s
+Average time per cell: 57.8ms

@@ -9,7 +9,7 @@ import shutil
 from tqdm import tqdm
 from datetime import datetime
 import uuid
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Any
 import json
 import pandas as pd
 import logging
@@ -17,6 +17,8 @@ from yolo_sam_inference.web.app import get_roi_coordinates_web
 from yolo_sam_inference.utils import setup_logger
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from skimage.measure import regionprops, regionprops_table
+from yolo_sam_inference.utils.metrics import calculate_metrics
 
 # Set up logger with reduced verbosity
 logger = setup_logger(__name__)
@@ -120,6 +122,23 @@ class OpenCVPipeline:
         if contours:
             cv2.drawContours(mask, contours, -1, 1, thickness=cv2.FILLED)
         return mask
+
+    def calculate_contour_metrics(self, contour: np.ndarray, image: np.ndarray) -> Dict[str, Any]:
+        """Calculate metrics for a single contour using the existing metrics function."""
+        # Create a mask for this contour
+        mask = np.zeros(image.shape[:2], dtype=np.uint8)
+        cv2.drawContours(mask, [contour], -1, 1, thickness=cv2.FILLED)
+        
+        # Ensure image is RGB for the metrics calculation
+        if len(image.shape) == 2:
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+        else:
+            rgb_image = image
+            
+        # Use the existing metrics calculation function
+        metrics = calculate_metrics(rgb_image, mask)
+        
+        return metrics
 
 def parse_args():
     """Parse command line arguments."""
@@ -265,6 +284,7 @@ def process_single_image(args):
             h, w = image.shape[:2]
             x_min, y_min = 0, 0
             x_max, y_max = w, h
+            filtered_contours = contours
         else:
             # Filter contours based on whether they intersect with the ROI
             filtered_contours = []
@@ -281,9 +301,18 @@ def process_single_image(args):
             # Create filtered mask from filtered contours
             filtered_mask = pipeline.contours_to_mask(filtered_contours, image.shape[:2])
         
+        # Calculate metrics for each contour
+        all_contour_metrics = []
+        for i, contour in enumerate(filtered_contours):
+            metrics = pipeline.calculate_contour_metrics(contour, image)
+            metrics['cell_id'] = i
+            metrics['image_name'] = image_name
+            metrics['is_cropped'] = is_cropped
+            all_contour_metrics.append(metrics)
+        
         # Save visualization
         vis_path = str(Path(output_dir) / f"{image_name}_visualization.png")
-        save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y_max, vis_path)
+        save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y_max, vis_path, all_contour_metrics)
         
         # Save masks
         mask_path = str(Path(output_dir) / f"{image_name}_mask.png")
@@ -295,14 +324,15 @@ def process_single_image(args):
         total_area = np.sum(mask > 0)
         roi_area = np.sum(filtered_mask > 0)
         
-        print(f"  Processed successfully: total_area={total_area}, roi_area={roi_area}")
+        print(f"  Processed successfully: total_area={total_area}, roi_area={roi_area}, contours={len(filtered_contours)}")
         
         return {
             'image_name': image_name,
             'is_cropped': is_cropped,
             'total_area': total_area,
             'roi_area': roi_area,
-            'processing_time': times.get('total_processing_time', 0)
+            'processing_time': times.get('total_processing_time', 0),
+            'contour_metrics': all_contour_metrics
         }
     except Exception as e:
         print(f"Error processing image {image_path}: {str(e)}")
@@ -310,7 +340,7 @@ def process_single_image(args):
         traceback.print_exc()
         return None
 
-def save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y_max, vis_path):
+def save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y_max, vis_path, contour_metrics=None):
     """Save visualization of the processing results."""
     # Create a color version of the image if it's grayscale
     if len(image.shape) == 2 or image.shape[2] == 1:
@@ -318,75 +348,55 @@ def save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y
     else:
         vis_image = image.copy()
     
-    # Check if this is a cropped image by comparing masks
-    is_cropped = np.array_equal(mask, filtered_mask)
+    # Create a copy for the filtered visualization
+    filtered_vis = vis_image.copy()
     
-    # If it's a cropped image, we'll only show one visualization
-    if is_cropped:
-        # Draw ROI rectangle
-        cv2.rectangle(vis_image, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-        
-        # Apply mask overlay
-        mask_overlay = vis_image.copy()
-        
-        # Create colored mask for visualization
-        color_mask = np.zeros_like(vis_image)
-        color_mask[mask > 0] = [255, 0, 0]  # Blue for contours
-        
-        # Blend the mask with the original image
-        cv2.addWeighted(mask_overlay, 0.7, color_mask, 0.3, 0, mask_overlay)
-        
-        # Add title
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        font_thickness = 1
-        font_color = (255, 255, 255)
-        cv2.putText(mask_overlay, "Contours", (10, 20), font, font_scale, font_color, font_thickness)
-        
-        # Save the visualization
-        cv2.imwrite(vis_path, mask_overlay)
-    else:
-        # For full frame images, show both all contours and ROI contours
-        # Create a copy for the filtered visualization
-        filtered_vis = vis_image.copy()
-        
-        # Draw ROI rectangle
-        cv2.rectangle(vis_image, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-        cv2.rectangle(filtered_vis, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
-        
-        # Apply mask overlay
-        mask_overlay = vis_image.copy()
-        filtered_overlay = filtered_vis.copy()
-        
-        # Create colored masks for visualization
-        color_mask = np.zeros_like(vis_image)
-        color_mask[mask > 0] = [0, 0, 255]  # Red for all contours
-        
-        color_filtered_mask = np.zeros_like(filtered_vis)
-        color_filtered_mask[filtered_mask > 0] = [255, 0, 0]  # Blue for ROI contours
-        
-        # Blend the masks with the original image
-        cv2.addWeighted(mask_overlay, 0.7, color_mask, 0.3, 0, mask_overlay)
-        cv2.addWeighted(filtered_overlay, 0.7, color_filtered_mask, 0.3, 0, filtered_overlay)
-        
-        # Create a combined visualization
-        h, w = vis_image.shape[:2]
-        combined = np.zeros((h, w*2, 3), dtype=np.uint8)
-        combined[:, :w] = mask_overlay
-        combined[:, w:] = filtered_overlay
-        
-        # Add titles only
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.5
-        font_thickness = 1
-        font_color = (255, 255, 255)
-        
-        # Add titles
-        cv2.putText(combined, "All Contours", (10, 20), font, font_scale, font_color, font_thickness)
-        cv2.putText(combined, "ROI Contours", (w+10, 20), font, font_scale, font_color, font_thickness)
-        
-        # Save the visualization
-        cv2.imwrite(vis_path, combined)
+    # Draw ROI rectangle
+    cv2.rectangle(vis_image, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+    cv2.rectangle(filtered_vis, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+    
+    # Apply mask overlay
+    mask_overlay = vis_image.copy()
+    filtered_overlay = filtered_vis.copy()
+    
+    # Create colored masks for visualization
+    color_mask = np.zeros_like(vis_image)
+    color_mask[mask > 0] = [0, 0, 255]  # Red for all contours
+    
+    color_filtered_mask = np.zeros_like(filtered_vis)
+    color_filtered_mask[filtered_mask > 0] = [255, 0, 0]  # Blue for ROI contours
+    
+    # Blend the masks with the original image
+    cv2.addWeighted(mask_overlay, 0.7, color_mask, 0.3, 0, mask_overlay)
+    cv2.addWeighted(filtered_overlay, 0.7, color_filtered_mask, 0.3, 0, filtered_overlay)
+    
+    # Create a combined visualization
+    h, w = vis_image.shape[:2]
+    combined = np.zeros((h, w*2, 3), dtype=np.uint8)
+    combined[:, :w] = mask_overlay
+    combined[:, w:] = filtered_overlay
+    
+    # Add titles only
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_thickness = 1
+    font_color = (255, 255, 255)
+    
+    # Add titles
+    cv2.putText(combined, "All Contours", (10, 20), font, font_scale, font_color, font_thickness)
+    cv2.putText(combined, "ROI Contours", (w+10, 20), font, font_scale, font_color, font_thickness)
+    
+    # Add metrics information if available
+    if contour_metrics:
+        y_pos = 40
+        # Calculate average deformability
+        avg_deformability = np.mean([m['deformability'] for m in contour_metrics]) if contour_metrics else 0
+        cv2.putText(combined, f"Contours: {len(contour_metrics)}", (w+10, y_pos), font, font_scale, font_color, font_thickness)
+        y_pos += 20
+        cv2.putText(combined, f"Avg Deformability: {avg_deformability:.4f}", (w+10, y_pos), font, font_scale, font_color, font_thickness)
+    
+    # Save the visualization
+    cv2.imwrite(vis_path, combined)
 
 def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, background_path: str, roi_coordinates: Dict, pbar=None):
     """Process all images in a condition directory."""
@@ -525,14 +535,17 @@ def count_total_images(condition_dirs):
     return total_images
 
 def save_results_to_csv(results, output_dir):
-    """Save processing results to CSV files using efficient batch writing."""
+    """Save processing results to CSV files focusing on cell metrics."""
     # Prepare data in memory first
-    timing_data = []
-    contour_data = []
+    cell_metrics_data = []
+    processing_times = []
     
     for result in results:
-        # Add timing data
-        timing_data.append({
+        if result is None:
+            continue
+            
+        # Add processing time data
+        processing_times.append({
             'image_name': result['image_name'],
             'is_cropped': result.get('is_cropped', False),
             'total_area': result['total_area'],
@@ -540,28 +553,52 @@ def save_results_to_csv(results, output_dir):
             'processing_time': result['processing_time']
         })
         
-        # Add contour data
-        contour_data.append({
-            'image_name': result['image_name'],
-            'is_cropped': result.get('is_cropped', False),
-            'total_area': result['total_area'],
-            'roi_area': result['roi_area'],
-            'processing_time': result['processing_time']
-        })
+        # Add cell metrics data
+        if 'contour_metrics' in result:
+            for cell_metric in result['contour_metrics']:
+                # Add image information to each cell metric
+                cell_metric['image_name'] = result['image_name']
+                cell_metric['is_cropped'] = result.get('is_cropped', False)
+                cell_metrics_data.append(cell_metric)
     
     # Write data in batches
     chunk_size = 1000
     
-    # Save timing data
-    timing_df = pd.DataFrame(timing_data)
-    timing_df.to_csv(output_dir / 'processing_times.csv', index=False)
+    # Save processing times for reference
+    if processing_times:
+        times_df = pd.DataFrame(processing_times)
+        times_df.to_csv(output_dir / 'processing_times.csv', index=False)
     
-    # Save contour data in chunks to manage memory
-    for i in range(0, len(contour_data), chunk_size):
-        chunk = pd.DataFrame(contour_data[i:i + chunk_size])
-        mode = 'w' if i == 0 else 'a'
-        header = i == 0
-        chunk.to_csv(output_dir / 'contours.csv', index=False, mode=mode, header=header)
+    # Save cell metrics data
+    if cell_metrics_data:
+        # Create DataFrame with all cell metrics
+        cell_metrics_df = pd.DataFrame(cell_metrics_data)
+        
+        # Save complete cell metrics
+        cell_metrics_df.to_csv(output_dir / 'cell_metrics.csv', index=False)
+        
+        # Create a summary metrics file with deformability statistics per image
+        summary_data = []
+        for image_name, group in cell_metrics_df.groupby('image_name'):
+            summary_data.append({
+                'image_name': image_name,
+                'cell_count': len(group),
+                'mean_deformability': group['deformability'].mean(),
+                'std_deformability': group['deformability'].std(),
+                'min_deformability': group['deformability'].min(),
+                'max_deformability': group['deformability'].max(),
+                'mean_area': group['area'].mean(),
+                'total_area': group['area'].sum()
+            })
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_csv(output_dir / 'deformability_summary.csv', index=False)
+        
+        # Log summary statistics
+        logger.info(f"Saved metrics for {len(cell_metrics_data)} cells across {len(summary_data)} images")
+        if summary_data:
+            avg_deformability = sum(item['mean_deformability'] for item in summary_data) / len(summary_data)
+            logger.info(f"Average deformability across all images: {avg_deformability:.4f}")
 
 def main():
     try:

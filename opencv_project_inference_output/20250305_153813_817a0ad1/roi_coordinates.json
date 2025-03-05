@@ -1,0 +1,20 @@
+{
+  "condition_12%_18um": {
+    "x_min": 396,
+    "x_max": 504,
+    "y_min": 17,
+    "y_max": 82
+  },
+  "condition_12%_24um": {
+    "x_min": 393,
+    "x_max": 504,
+    "y_min": 6,
+    "y_max": 74
+  },
+  "condition_12%_13um": {
+    "x_min": 386,
+    "x_max": 502,
+    "y_min": 18,
+    "y_max": 86
+  }
+}
