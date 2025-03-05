@@ -39,34 +39,55 @@ class OpenCVPipeline:
         self._cached_backgrounds = {}  # Cache for processed backgrounds
 
     def _process_background(self, background_path: str) -> np.ndarray:
-        """Process and cache background image."""
-        if background_path not in self._cached_backgrounds:
-            background = cv2.imread(background_path, cv2.IMREAD_GRAYSCALE)
-            if background is None:
-                raise ValueError(f"Failed to load background image: {background_path}")
-            blurred_bg = cv2.GaussianBlur(background, self.blur_kernel_size, self.blur_sigma)
-            self._cached_backgrounds[background_path] = blurred_bg
-        return self._cached_backgrounds[background_path]
+        """Process background image."""
+        if not background_path or not os.path.exists(background_path):
+            print(f"WARNING: Background image not found at {background_path}")
+            return None
+        
+        background = cv2.imread(background_path, cv2.IMREAD_GRAYSCALE)
+        if background is None:
+            print(f"WARNING: Failed to read background image at {background_path}")
+            return None
+        
+        # Apply blur to reduce noise
+        background = cv2.GaussianBlur(background, self.blur_kernel_size, self.blur_sigma)
+        return background
 
     def process_image(self, image_path: str, background_path: str) -> Tuple[List[np.ndarray], Dict[str, float]]:
-        """Process an image to find contours using OpenCV pipeline."""
-        # Load and process image
+        """Process a single image and return contours and timing information."""
+        start_time = time.time()
+        
+        # Read image
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             raise ValueError(f"Failed to load image: {image_path}")
         
-        # Get processed background
-        blurred_bg = self._process_background(background_path)
+        # Process background
+        background = self._process_background(background_path)
         
-        total_start_time = time.perf_counter()
+        # Timing information
+        times = {}
+        
+        # Background subtraction
+        bg_start = time.time()
+        if background is not None:
+            # Ensure image and background have the same dimensions
+            if image.shape != background.shape:
+                background = cv2.resize(background, (image.shape[1], image.shape[0]))
+            
+            # Subtract background
+            diff = cv2.absdiff(image, background)
+        else:
+            # If no background, just use the original image
+            diff = image
+        times['background_subtraction'] = time.time() - bg_start
         
         # Pre-processing (optimized operations)
         pre_processing_start = time.perf_counter()
         
         # Combine operations where possible to reduce memory allocations
-        blurred = cv2.GaussianBlur(image, self.blur_kernel_size, self.blur_sigma)
-        bg_sub = cv2.subtract(blurred, blurred_bg)
-        _, binary = cv2.threshold(bg_sub, self.threshold_value, 255, cv2.THRESH_BINARY)
+        blurred = cv2.GaussianBlur(diff, self.blur_kernel_size, self.blur_sigma)
+        _, binary = cv2.threshold(blurred, self.threshold_value, 255, cv2.THRESH_BINARY)
         
         # Combine morphological operations
         morph = cv2.dilate(binary, self.kernel, iterations=self.dilate_iterations)
@@ -83,7 +104,7 @@ class OpenCVPipeline:
         find_contours_time = (find_contours_end - find_contours_start) * 1000
 
         total_end_time = time.perf_counter()
-        total_processing_time = (total_end_time - total_start_time) * 1000
+        total_processing_time = (total_end_time - start_time) * 1000
 
         times = {
             'pre_processing_time': pre_processing_time,
@@ -94,17 +115,10 @@ class OpenCVPipeline:
         return contours, times
     
     def contours_to_mask(self, contours: List[np.ndarray], shape: Tuple[int, int]) -> np.ndarray:
-        """Convert contours to a binary mask.
-        
-        Args:
-            contours: List of contours
-            shape: Shape of the output mask (height, width)
-            
-        Returns:
-            Binary mask
-        """
+        """Convert contours to binary mask."""
         mask = np.zeros(shape, dtype=np.uint8)
-        cv2.drawContours(mask, contours, -1, 255, thickness=cv2.FILLED)
+        if contours:
+            cv2.drawContours(mask, contours, -1, 1, thickness=cv2.FILLED)
         return mask
 
 def parse_args():
@@ -136,17 +150,31 @@ def parse_args():
     )
     
     parser.add_argument(
-        '--dilate-iterations',
+        '--dilate',
         type=int,
         default=2,
         help='Number of dilation iterations'
     )
     
     parser.add_argument(
-        '--erode-iterations',
+        '--erode',
         type=int,
         default=2,
         help='Number of erosion iterations'
+    )
+    
+    parser.add_argument(
+        '--blur',
+        type=int,
+        default=3,
+        help='Blur kernel size (NxN)'
+    )
+    
+    parser.add_argument(
+        '--sigma',
+        type=int,
+        default=0,
+        help='Sigma value for Gaussian blur'
     )
     
     return parser.parse_args()
@@ -190,120 +218,293 @@ def create_hardlinks_for_batch(condition_dir, image_mapping):
     return temp_dir
 
 def process_single_image(args):
-    """Process a single image with the pipeline."""
-    image_path, background_path, pipeline, condition_output_dir, roi = args
+    """Process a single image with the OpenCV pipeline."""
+    image_path, background_path, pipeline, output_dir, roi = args
+    
     try:
+        # Extract image name from path
+        image_name = Path(image_path).stem
+        image_path_str = str(image_path)
+        
+        # Skip background images
+        if 'background' in image_name.lower():
+            return None
+        
+        print(f"Processing image: {image_path}")
+        
+        # Check if this is a cropped image
+        is_cropped = 'cropped_roi' in image_path_str
+        
         # Process the image
-        contours, times = pipeline.process_image(str(image_path), background_path)
+        contours, times = pipeline.process_image(image_path_str, background_path)
         
-        # Convert contours to mask
-        image = cv2.imread(str(image_path), cv2.IMREAD_GRAYSCALE)
-        mask = pipeline.contours_to_mask(contours, image.shape)
+        print(f"  Found {len(contours)} contours")
         
-        # Filter contours based on ROI
-        x_min, x_max = roi['x_min'], roi['x_max']
-        y_min, y_max = roi['y_min'], roi['y_max']
+        if not contours:
+            print(f"  No contours found, skipping")
+            return None
         
-        filtered_contours = []
-        filtered_mask = np.zeros_like(mask)
-        for contour in contours:
-            M = cv2.moments(contour)
-            if M["m00"] != 0:
-                center_x = int(M["m10"] / M["m00"])
-                center_y = int(M["m01"] / M["m00"])
-                if (x_min <= center_x <= x_max) and (y_min <= center_y <= y_max):
+        # Create mask from contours
+        image = cv2.imread(image_path_str)
+        if image is None:
+            print(f"  Failed to read image for visualization: {image_path}")
+            return None
+            
+        mask = pipeline.contours_to_mask(contours, image.shape[:2])
+        
+        # Apply ROI filtering
+        x_min, y_min = roi['x_min'], roi['y_min']
+        x_max, y_max = roi['x_max'], roi['y_max']
+        
+        # For cropped images, we need to adjust the ROI or use the entire image
+        if is_cropped:
+            # For cropped images, consider the entire image as the ROI
+            print(f"  This is a cropped image, using entire image as ROI")
+            filtered_mask = mask.copy()
+            # Use image dimensions for visualization
+            h, w = image.shape[:2]
+            x_min, y_min = 0, 0
+            x_max, y_max = w, h
+        else:
+            # Filter contours based on whether they intersect with the ROI
+            filtered_contours = []
+            for contour in contours:
+                # Create a mask for this contour
+                contour_mask = np.zeros(image.shape[:2], dtype=np.uint8)
+                cv2.drawContours(contour_mask, [contour], -1, 1, thickness=cv2.FILLED)
+                
+                # Check if any part of the contour is within the ROI
+                roi_section = contour_mask[y_min:y_max, x_min:x_max]
+                if np.any(roi_section > 0):
                     filtered_contours.append(contour)
-                    cv2.drawContours(filtered_mask, [contour], -1, 255, thickness=cv2.FILLED)
+            
+            # Create filtered mask from filtered contours
+            filtered_mask = pipeline.contours_to_mask(filtered_contours, image.shape[:2])
         
-        # Save visualization using a thread-safe approach
-        vis_path = condition_output_dir / f"{Path(image_path).stem}_result.png"
+        # Save visualization
+        vis_path = str(Path(output_dir) / f"{image_name}_visualization.png")
         save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y_max, vis_path)
         
-        return {
-            'image_path': str(image_path),
-            'condition': Path(image_path).parent.name,
-            'contours': filtered_contours,
-            'mask': filtered_mask,
-            'times': times,
-            'roi': {'x_min': x_min, 'x_max': x_max, 'y_min': y_min, 'y_max': y_max}
-        }
+        # Save masks
+        mask_path = str(Path(output_dir) / f"{image_name}_mask.png")
+        filtered_mask_path = str(Path(output_dir) / f"{image_name}_filtered_mask.png")
+        cv2.imwrite(mask_path, mask * 255)
+        cv2.imwrite(filtered_mask_path, filtered_mask * 255)
         
+        # Calculate metrics
+        total_area = np.sum(mask > 0)
+        roi_area = np.sum(filtered_mask > 0)
+        
+        print(f"  Processed successfully: total_area={total_area}, roi_area={roi_area}")
+        
+        return {
+            'image_name': image_name,
+            'is_cropped': is_cropped,
+            'total_area': total_area,
+            'roi_area': roi_area,
+            'processing_time': times.get('total_processing_time', 0)
+        }
     except Exception as e:
-        logger.error(f"Error processing image {image_path}: {str(e)}")
+        print(f"Error processing image {image_path}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def save_visualization(image, mask, filtered_mask, times, x_min, y_min, x_max, y_max, vis_path):
-    """Thread-safe visualization saving."""
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    """Save visualization of the processing results."""
+    # Create a color version of the image if it's grayscale
+    if len(image.shape) == 2 or image.shape[2] == 1:
+        vis_image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    else:
+        vis_image = image.copy()
     
-    ax1.imshow(image, cmap='gray')
-    rect = plt.Rectangle((x_min, y_min), x_max - x_min, y_max - y_min,
-                      fill=False, color='r', linestyle='--', alpha=0.5)
-    ax1.add_patch(rect)
-    ax1.set_title('Original Image with ROI')
-    ax1.axis('off')
+    # Check if this is a cropped image by comparing masks
+    is_cropped = np.array_equal(mask, filtered_mask)
     
-    ax2.imshow(mask, cmap='gray')
-    ax2.set_title('Raw OpenCV Mask')
-    ax2.axis('off')
-    
-    ax3.imshow(filtered_mask, cmap='gray')
-    ax3.set_title('ROI Filtered Mask')
-    ax3.axis('off')
-    
-    plt.suptitle(f"Processing Times: Pre={times['pre_processing_time']:.2f}ms, "
-               f"Contours={times['find_contours_time']:.2f}ms, "
-               f"Total={times['total_processing_time']:.2f}ms")
-    plt.tight_layout()
-    plt.savefig(vis_path)
-    plt.close()
+    # If it's a cropped image, we'll only show one visualization
+    if is_cropped:
+        # Draw ROI rectangle
+        cv2.rectangle(vis_image, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+        
+        # Apply mask overlay
+        mask_overlay = vis_image.copy()
+        
+        # Create colored mask for visualization
+        color_mask = np.zeros_like(vis_image)
+        color_mask[mask > 0] = [255, 0, 0]  # Blue for contours
+        
+        # Blend the mask with the original image
+        cv2.addWeighted(mask_overlay, 0.7, color_mask, 0.3, 0, mask_overlay)
+        
+        # Add title
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        font_thickness = 1
+        font_color = (255, 255, 255)
+        cv2.putText(mask_overlay, "Contours", (10, 20), font, font_scale, font_color, font_thickness)
+        
+        # Save the visualization
+        cv2.imwrite(vis_path, mask_overlay)
+    else:
+        # For full frame images, show both all contours and ROI contours
+        # Create a copy for the filtered visualization
+        filtered_vis = vis_image.copy()
+        
+        # Draw ROI rectangle
+        cv2.rectangle(vis_image, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+        cv2.rectangle(filtered_vis, (x_min, y_min), (x_max, y_max), (0, 255, 0), 2)
+        
+        # Apply mask overlay
+        mask_overlay = vis_image.copy()
+        filtered_overlay = filtered_vis.copy()
+        
+        # Create colored masks for visualization
+        color_mask = np.zeros_like(vis_image)
+        color_mask[mask > 0] = [0, 0, 255]  # Red for all contours
+        
+        color_filtered_mask = np.zeros_like(filtered_vis)
+        color_filtered_mask[filtered_mask > 0] = [255, 0, 0]  # Blue for ROI contours
+        
+        # Blend the masks with the original image
+        cv2.addWeighted(mask_overlay, 0.7, color_mask, 0.3, 0, mask_overlay)
+        cv2.addWeighted(filtered_overlay, 0.7, color_filtered_mask, 0.3, 0, filtered_overlay)
+        
+        # Create a combined visualization
+        h, w = vis_image.shape[:2]
+        combined = np.zeros((h, w*2, 3), dtype=np.uint8)
+        combined[:, :w] = mask_overlay
+        combined[:, w:] = filtered_overlay
+        
+        # Add titles only
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        font_thickness = 1
+        font_color = (255, 255, 255)
+        
+        # Add titles
+        cv2.putText(combined, "All Contours", (10, 20), font, font_scale, font_color, font_thickness)
+        cv2.putText(combined, "ROI Contours", (w+10, 20), font, font_scale, font_color, font_thickness)
+        
+        # Save the visualization
+        cv2.imwrite(vis_path, combined)
 
 def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, background_path: str, roi_coordinates: Dict, pbar=None):
-    """Process all images within a condition directory using parallel processing."""
-    condition_output_dir = run_output_dir / condition_dir.name
-    condition_output_dir.mkdir(parents=True, exist_ok=True)
+    """Process all images in a condition directory."""
+    condition_name = condition_dir.name
+    condition_output_dir = run_output_dir / condition_name
+    condition_output_dir.mkdir(exist_ok=True)
+    
+    print(f"\nProcessing condition: {condition_name}")
+    
+    # Find all image files in the condition directory (recursively)
+    image_files = []
+    for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+        found_files = list(condition_dir.glob(f"**/*{ext}"))
+        print(f"  Found {len(found_files)} {ext} files")
+        image_files.extend(found_files)
+    
+    # Filter out background images
+    original_count = len(image_files)
+    image_files = [f for f in image_files if 'background' not in f.name.lower()]
+    print(f"  After filtering out background images: {len(image_files)} of {original_count} files remain")
+    
+    # Separate full frame and cropped images
+    full_frame_images = [f for f in image_files if 'full_frames' in str(f)]
+    cropped_images = [f for f in image_files if 'cropped_roi' in str(f)]
+    print(f"  Full frame images: {len(full_frame_images)}")
+    print(f"  Cropped ROI images: {len(cropped_images)}")
+    
+    # Find background images in each batch folder
+    background_images = {}
+    for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+        for bg_file in condition_dir.glob(f"**/*background*{ext}"):
+            batch_folder = bg_file.parent.parent  # Go up two levels to get the batch folder
+            batch_name = batch_folder.name
+            background_images[batch_name] = str(bg_file)
+            print(f"  Found background image for batch {batch_name}: {bg_file}")
+    
+    if not background_images:
+        print(f"  WARNING: No background images found")
+        # Use the provided background path as fallback
+        if background_path:
+            print(f"  Using fallback background image: {background_path}")
+    
+    # Get ROI coordinates for this condition
+    if condition_name not in roi_coordinates:
+        raise ValueError(f"No ROI coordinates found for condition: {condition_name}")
+    
+    roi = roi_coordinates[condition_name]
+    x_min, y_min = roi['x_min'], roi['y_min']
+    x_max, y_max = roi['x_max'], roi['y_max']
+    print(f"  Using ROI: x={x_min}-{x_max}, y={y_min}-{y_max}")
     
     try:
-        condition_roi = roi_coordinates.get(condition_dir.name)
-        if condition_roi is None:
-            logger.warning(f"No ROI coordinates found for condition {condition_dir.name}")
-            return []
-        
-        # Get image paths
-        image_mapping = collect_image_paths(condition_dir)
-        temp_dir = create_hardlinks_for_batch(condition_dir, image_mapping)
-        
         # Prepare arguments for parallel processing
         process_args = []
-        for image_path in temp_dir.glob("*"):
-            if image_path.suffix.lower() in ['.png', '.jpg', '.jpeg', '.tiff']:
-                process_args.append((
-                    str(image_path),
-                    background_path,
-                    pipeline,
-                    condition_output_dir,
-                    condition_roi
-                ))
+        
+        # Add full frame images first
+        for image_path in full_frame_images:
+            # Determine which background image to use
+            batch_folder = image_path.parent.parent  # Go up two levels to get the batch folder
+            batch_name = batch_folder.name
+            img_background_path = background_images.get(batch_name, background_path)
+            
+            process_args.append((
+                str(image_path),
+                img_background_path,
+                pipeline,
+                condition_output_dir / "full_frames",
+                roi
+            ))
+        
+        # Then add cropped images
+        for image_path in cropped_images:
+            # Determine which background image to use
+            batch_folder = image_path.parent.parent  # Go up two levels to get the batch folder
+            batch_name = batch_folder.name
+            img_background_path = background_images.get(batch_name, background_path)
+            
+            process_args.append((
+                str(image_path),
+                img_background_path,
+                pipeline,
+                condition_output_dir / "cropped",
+                roi
+            ))
+        
+        print(f"  Processing {len(process_args)} images")
+        
+        # Create output directories
+        (condition_output_dir / "full_frames").mkdir(exist_ok=True)
+        (condition_output_dir / "cropped").mkdir(exist_ok=True)
         
         # Process images in parallel using a ProcessPoolExecutor
         results = []
         n_workers = max(1, mp.cpu_count() - 1)  # Leave one CPU free
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
-            for result in executor.map(process_single_image, process_args):
+            futures = []
+            for args in process_args:
+                futures.append(executor.submit(process_single_image, args))
+            
+            for future in futures:
+                result = future.result()
                 if result is not None:
                     results.append(result)
                 if pbar:
                     pbar.update(1)
         
+        # Separate results by image type
+        full_frame_results = [r for r in results if not r.get('is_cropped', False)]
+        cropped_results = [r for r in results if r.get('is_cropped', False)]
+        
+        print(f"  Processed {len(full_frame_results)} full frame images successfully")
+        print(f"  Processed {len(cropped_results)} cropped images successfully")
+        
         return results
         
     except Exception as e:
-        logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
+        logger.error(f"Error processing condition {condition_name}: {str(e)}")
         raise
-    finally:
-        # Clean up temporary directory
-        if 'temp_dir' in locals() and temp_dir.exists():
-            shutil.rmtree(temp_dir)
 
 def create_run_output_dir(base_output_dir: Path) -> Tuple[Path, str]:
     """Create a unique run output directory."""
@@ -332,21 +533,21 @@ def save_results_to_csv(results, output_dir):
     for result in results:
         # Add timing data
         timing_data.append({
-            'image_path': result['image_path'],
-            'condition': result['condition'],
-            'pre_processing_time': result['times']['pre_processing_time'],
-            'find_contours_time': result['times']['find_contours_time'],
-            'total_processing_time': result['times']['total_processing_time']
+            'image_name': result['image_name'],
+            'is_cropped': result.get('is_cropped', False),
+            'total_area': result['total_area'],
+            'roi_area': result['roi_area'],
+            'processing_time': result['processing_time']
         })
         
         # Add contour data
-        for i, contour in enumerate(result['contours']):
-            contour_data.append({
-                'image_path': result['image_path'],
-                'condition': result['condition'],
-                'contour_id': i,
-                'contour_points': contour.tolist()
-            })
+        contour_data.append({
+            'image_name': result['image_name'],
+            'is_cropped': result.get('is_cropped', False),
+            'total_area': result['total_area'],
+            'roi_area': result['roi_area'],
+            'processing_time': result['processing_time']
+        })
     
     # Write data in batches
     chunk_size = 1000
@@ -376,6 +577,9 @@ def main():
         
         # Get condition directories
         condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
+        print(f"Found {len(condition_dirs)} condition directories:")
+        for d in condition_dirs:
+            print(f"  - {d.name}")
         
         print("\nOpening web interface for ROI selection...")
         print("Please select ROI coordinates for each condition in the browser window.")
@@ -398,55 +602,46 @@ def main():
         print(f"\nInitializing OpenCV pipeline... [Run ID: {run_id}]")
         pipeline = OpenCVPipeline(
             threshold_value=args.threshold,
-            dilate_iterations=args.dilate_iterations,
-            erode_iterations=args.erode_iterations
+            dilate_iterations=args.dilate,
+            erode_iterations=args.erode,
+            blur_kernel_size=(args.blur, args.blur),
+            blur_sigma=args.sigma
         )
         
-        # Process conditions with progress tracking
+        # Count total images for progress bar
+        total_images = 0
+        for condition_dir in condition_dirs:
+            for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+                total_images += len(list(condition_dir.glob(f"**/*{ext}")))
+        
+        print(f"Found {total_images} total images across all conditions")
+        
+        # Process all conditions
         start_time = time.time()
         all_results = []
-        total_images = count_total_images(condition_dirs)
         
         with tqdm(total=total_images, desc="Processing images", unit="image") as pbar:
-            # Process conditions in parallel
-            with ThreadPoolExecutor(max_workers=min(len(condition_dirs), 4)) as executor:
-                future_to_condition = {}
-                
-                for condition_dir in condition_dirs:
-                    # Find background image
-                    background_path = next((str(f) for f in condition_dir.glob("*") 
-                                         if 'background' in f.name.lower()), None)
-                    
-                    if not background_path:
-                        logger.warning(f"No background image found in condition {condition_dir.name}")
-                        continue
-                    
-                    print(f"\nProcessing condition: {condition_dir.name}")
-                    print(f"Using ROI coordinates: {roi_coordinates[condition_dir.name]}")
-                    
-                    # Submit condition processing task
-                    future = executor.submit(
-                        process_condition,
+            # Process conditions sequentially for better debugging
+            for condition_dir in condition_dirs:
+                try:
+                    condition_results = process_condition(
                         pipeline=pipeline,
                         condition_dir=condition_dir,
                         run_output_dir=run_output_dir,
                         run_id=run_id,
-                        background_path=background_path,
+                        background_path=None,  # Will be found in process_condition
                         roi_coordinates=roi_coordinates,
                         pbar=pbar
                     )
-                    future_to_condition[future] = condition_dir.name
-                
-                # Collect results as they complete
-                for future in future_to_condition:
-                    try:
-                        condition_results = future.result()
+                    if condition_results:
                         all_results.extend(condition_results)
-                    except Exception as e:
-                        condition = future_to_condition[future]
-                        logger.error(f"Error processing condition {condition}: {str(e)}")
+                except Exception as e:
+                    logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
+                    print(f"Error processing condition {condition_dir.name}: {str(e)}")
         
         total_runtime = time.time() - start_time
+        
+        print(f"\nProcessed {len(all_results)} images successfully across all conditions")
         
         # Save results
         print("\nSaving results...")

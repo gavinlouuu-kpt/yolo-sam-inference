@@ -79,8 +79,17 @@
         <div class="coordinates-info">
             Selected ROI: <span id="coordinates"></span>
         </div>
+        <div id="debug-info"
+            style="margin: 10px 0; padding: 10px; background-color: #ffeeee; border: 1px solid #ff0000;">
+            <h3>Debug Information</h3>
+            <div>Image URL: <span id="debug-image-url"></span></div>
+            <div>Image Load Status: <span id="debug-image-status">Loading...</span></div>
+            <div>Image Natural Size: <span id="debug-image-size">Unknown</span></div>
+        </div>
         <div class="image-container">
-            <img id="image" src="" alt="Select ROI">
+            <img id="image" src="" alt="Select ROI"
+                onerror="document.getElementById('debug-image-status').textContent = 'Error: ' + event.type; console.error('Image load error:', event);"
+                onload="document.getElementById('debug-image-status').textContent = 'Loaded successfully'; document.getElementById('debug-image-size').textContent = this.naturalWidth + 'x' + this.naturalHeight;">
         </div>
         <div class="button-container">
             <button onclick="resetSelection()">Reset</button>
@@ -103,10 +112,31 @@
             e.preventDefault();
         });
 
-        // Update condition name and image source
-        const conditionName = new URLSearchParams(window.location.search).get('condition');
-        document.getElementById('condition-name').textContent = conditionName;
-        document.getElementById('image').src = `/image?condition=${conditionName}`;
+        // Get condition from server-side template variable or URL parameter as fallback
+        let conditionName = "{{ condition|default('') }}";
+        // If the template variable is empty, use URL parameter
+        if (!conditionName) {
+            conditionName = new URLSearchParams(window.location.search).get('condition');
+        }
+
+        document.getElementById('condition-name').textContent = conditionName || "No condition specified";
+
+        // Only try to load image if we have a valid condition
+        if (conditionName) {
+            const imageUrl = `/image?condition=${conditionName}`;
+            document.getElementById('image').src = imageUrl;
+            document.getElementById('debug-image-url').textContent = imageUrl;
+
+            // Add a direct test link to verify the image URL works
+            const testLink = document.createElement('a');
+            testLink.href = imageUrl;
+            testLink.textContent = 'Test direct image link';
+            testLink.target = '_blank';
+            document.getElementById('debug-info').appendChild(testLink);
+        } else {
+            document.getElementById('debug-image-status').textContent = 'Error: No valid condition specified';
+            document.getElementById('debug-image-url').textContent = 'N/A - Missing condition parameter';
+        }
 
         function getScaledCoordinates(clientX, clientY) {
             const rect = image.getBoundingClientRect();
