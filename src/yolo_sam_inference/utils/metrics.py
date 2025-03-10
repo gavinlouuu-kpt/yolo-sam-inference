@@ -1,7 +1,10 @@
 import numpy as np
-from skimage import measure
+from skimage import measure, draw
 from typing import Dict, Any
 from scipy.spatial import ConvexHull
+import logging
+
+logger = logging.getLogger(__name__)
 
 def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
     """Calculate various metrics for a segmented cell.
@@ -37,12 +40,18 @@ def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
             convex_hull_coords = np.vstack((convex_hull_coords, convex_hull_coords[0]))
             # Create convex hull mask
             convex_hull_mask = np.zeros_like(mask, dtype=bool)
-            rr, cc = measure.polygon(convex_hull_coords[:, 0], convex_hull_coords[:, 1], convex_hull_mask.shape)
-            convex_hull_mask[rr, cc] = True
+            # Convert coordinates to the format expected by polygon2mask
+            polygon_coords = np.column_stack((convex_hull_coords[:, 0], convex_hull_coords[:, 1]))
+            # Use polygon2mask to fill the interior of the polygon
+            convex_hull_mask = draw.polygon2mask(mask.shape, polygon_coords)
             # Calculate convex hull properties
             convex_props = measure.regionprops(convex_hull_mask.astype(int))[0]
-        except Exception:
+            
+            # Log successful convex hull calculation
+            logger.debug(f"Convex hull calculated successfully. Area: {convex_props.area}, Perimeter: {convex_props.perimeter}")
+        except Exception as e:
             # If convex hull calculation fails, use empty array and set properties to 0
+            logger.warning(f"Convex hull calculation failed: {str(e)}")
             convex_hull_coords = np.array([])
             convex_props = None
     else:
@@ -52,18 +61,18 @@ def calculate_metrics(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
     # Calculate area
     area = props.area
     
-    # Calculate circularity
+    # Calculate perimeter
     perimeter = props.perimeter
 
-    # Calculate convex hull perimeter
-    convex_hull_perimeter = convex_props.perimeter if convex_props else 0
-
-    circularity = (2 * np.sqrt(np.pi * convex_hull_area)) / convex_hull_perimeter if convex_hull_perimeter > 0 else 0 #DO NOT CHANGE THIS, USE AREA FROM CONVEX HULL
-    
-    # Calculate convex hull area and coordinates
+    # Calculate convex hull area and perimeter
     convex_hull_area = convex_props.area if convex_props else 0
+    convex_hull_perimeter = convex_props.perimeter if convex_props else 0
     
+    # Calculate area ratio
     area_ratio = convex_hull_area / area if area > 0 else 0
+    
+    # Calculate circularity
+    circularity = (2 * np.sqrt(np.pi * convex_hull_area)) / convex_hull_perimeter if convex_hull_perimeter > 0 else 0 #DO NOT CHANGE THIS, USE AREA FROM CONVEX HULL
     
     # Calculate deformability 
     deformability = 1 - circularity 

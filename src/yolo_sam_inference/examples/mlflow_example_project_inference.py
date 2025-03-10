@@ -29,6 +29,9 @@ import cv2
 import json
 import pandas as pd
 import logging
+import os
+import mlflow
+from mlflow.tracking import MlflowClient
 from yolo_sam_inference.web.app import get_roi_coordinates_web
 
 # Set up logger with reduced verbosity
@@ -56,7 +59,7 @@ def parse_args():
     parser.add_argument(
         '--output-dir', '-o',
         type=str,
-        default='D:\\code\\ai_cytometry\\yolo-sam-inference-pipeline\\project_inference_output',
+        default='/home/mib-p5-a5000/code/ai-cyto/output',
         help='Directory to save output results'
     )
     
@@ -132,6 +135,27 @@ def parse_args():
         type=int,
         default=2,
         help='Number of parallel pipelines to use for processing'
+    )
+    
+    # Add MLflow tracking arguments
+    parser.add_argument(
+        '--tracking-uri',
+        type=str,
+        default=os.getenv('MLFLOW_TRACKING_URI', 'http://localhost:5000'),
+        help='MLflow tracking server URI'
+    )
+    
+    parser.add_argument(
+        '--inference-experiment-name',
+        type=str,
+        default='yolo-sam-inference',
+        help='MLflow experiment name for tracking inference'
+    )
+    
+    parser.add_argument(
+        '--log-to-mlflow',
+        action='store_true',
+        help='Enable MLflow tracking for this inference run'
     )
     
     return parser.parse_args()
@@ -360,6 +384,287 @@ def filter_cells_by_roi(metrics_df: pd.DataFrame, roi_coordinates: Dict[str, Dic
     
     return gated_df
 
+def safe_log_artifact(file_path, artifact_path=None):
+    """
+    Safely log an artifact to MLflow, handling path conversion between Windows and WSL.
+    
+    Args:
+        file_path: Path to the file to log
+        artifact_path: Optional subdirectory within the artifact directory to log to
+    """
+    path_obj = Path(file_path)
+    if path_obj.exists():
+        if artifact_path:
+            mlflow.log_artifact(str(path_obj), artifact_path)
+        else:
+            mlflow.log_artifact(str(path_obj))
+    else:
+        # Try to convert Windows path to WSL path if needed
+        if str(path_obj).startswith('D:'):
+            # Convert Windows path to WSL path
+            wsl_path = str(path_obj).replace('D:', '/mnt/d').replace('\\', '/')
+            wsl_path_obj = Path(wsl_path)
+            if wsl_path_obj.exists():
+                if artifact_path:
+                    mlflow.log_artifact(str(wsl_path_obj), artifact_path)
+                else:
+                    mlflow.log_artifact(str(wsl_path_obj))
+            else:
+                logger.warning(f"Artifact file not found: {file_path} or {wsl_path}")
+        else:
+            logger.warning(f"Artifact file not found: {file_path}")
+
+def safe_log_image(img, artifact_path):
+    """
+    Safely log an image to MLflow.
+    
+    Args:
+        img: Image data to log
+        artifact_path: Path within the artifact directory to log to
+    """
+    try:
+        mlflow.log_image(img, artifact_path)
+    except Exception as e:
+        logger.warning(f"Failed to log image to MLflow: {str(e)}")
+
+def log_roi_selection_to_mlflow(condition_dirs, roi_coordinates: Dict[str, Dict[str, int]], run_output_dir: Path):
+    """
+    Create and log ROI selection visualizations to MLflow.
+    
+    Args:
+        condition_dirs: List of condition directories
+        roi_coordinates: Dictionary of ROI coordinates for each condition
+        run_output_dir: Path to the run output directory
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from matplotlib.patches import Rectangle
+        
+        # Create directory for ROI visualizations
+        roi_vis_dir = run_output_dir / "roi_visualizations"
+        roi_vis_dir.mkdir(exist_ok=True)
+        
+        for condition_dir in condition_dirs:
+            condition_name = condition_dir.name
+            
+            # Skip if no ROI coordinates for this condition
+            if condition_name not in roi_coordinates:
+                continue
+                
+            # Find a representative image from this condition
+            image_files = list(condition_dir.glob("**/*.png")) + list(condition_dir.glob("**/*.jpg")) + list(condition_dir.glob("**/*.tiff"))
+            if not image_files:
+                continue
+                
+            # Use the first image
+            image_path = image_files[0]
+            
+            # Read the image
+            img = cv2.imread(str(image_path))
+            if img is None:
+                continue
+                
+            # Convert BGR to RGB
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Get ROI coordinates
+            roi = roi_coordinates[condition_name]
+            min_x, max_x = roi.get('min_x', 0), roi.get('max_x', img.shape[1])
+            
+            # Create figure
+            fig, ax = plt.subplots(figsize=(12, 8))
+            ax.imshow(img)
+            
+            # Add ROI rectangle
+            height = img.shape[0]
+            rect = Rectangle((min_x, 0), max_x - min_x, height, 
+                            linewidth=2, edgecolor='r', facecolor='none')
+            ax.add_patch(rect)
+            
+            # Add title and labels
+            ax.set_title(f'ROI Selection for {condition_name}')
+            ax.text(min_x + 10, height - 30, f'min_x: {min_x}', color='white', 
+                   backgroundcolor='black', fontsize=12)
+            ax.text(max_x - 100, height - 30, f'max_x: {max_x}', color='white', 
+                   backgroundcolor='black', fontsize=12)
+            
+            # Save figure
+            roi_vis_path = roi_vis_dir / f"{condition_name}_roi.png"
+            plt.savefig(roi_vis_path)
+            
+            # Log to MLflow
+            safe_log_artifact(roi_vis_path, "roi_visualizations")
+            plt.close()
+            
+        return roi_vis_dir
+        
+    except Exception as e:
+        logger.warning(f"Failed to create ROI visualizations: {str(e)}")
+        return None
+
+def log_visualizations_to_mlflow(run_output_dir: Path, max_images_per_condition: int = 5):
+    """
+    Log a sample of visualization images to MLflow.
+    
+    Args:
+        run_output_dir: Path to the run output directory
+        max_images_per_condition: Maximum number of images to log per condition
+    """
+    # Find all visualization directories
+    for condition_dir in run_output_dir.iterdir():
+        if not condition_dir.is_dir():
+            continue
+            
+        # Look for visualizations directory
+        vis_dir = condition_dir / "visualizations"
+        if not vis_dir.exists() or not vis_dir.is_dir():
+            # Try WSL path conversion if needed
+            if str(vis_dir).startswith('D:'):
+                wsl_vis_dir = Path(str(vis_dir).replace('D:', '/mnt/d').replace('\\', '/'))
+                if wsl_vis_dir.exists() and wsl_vis_dir.is_dir():
+                    vis_dir = wsl_vis_dir
+                else:
+                    continue
+            else:
+                continue
+            
+        # Get all visualization images
+        vis_images = list(vis_dir.glob("*.png"))
+        
+        # Sample images if there are too many
+        if len(vis_images) > max_images_per_condition:
+            import random
+            vis_images = random.sample(vis_images, max_images_per_condition)
+        
+        # Log each image
+        for img_path in vis_images:
+            # Read the image
+            img = cv2.imread(str(img_path))
+            if img is None:
+                continue
+                
+            # Convert BGR to RGB
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            
+            # Log to MLflow
+            safe_log_image(img, f"visualizations/{condition_dir.name}/{img_path.name}")
+
+def create_and_log_summary_figures(metrics_df: pd.DataFrame, gated_metrics_df: pd.DataFrame, run_output_dir: Path):
+    """
+    Create and log summary figures to MLflow.
+    
+    Args:
+        metrics_df: DataFrame containing all cell metrics
+        gated_metrics_df: DataFrame containing gated cell metrics
+        run_output_dir: Path to the run output directory
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+        import io
+        from matplotlib.figure import Figure
+        
+        # Create directory for figures
+        figures_dir = run_output_dir / "figures"
+        figures_dir.mkdir(exist_ok=True)
+        
+        # 1. Create histogram of cell areas by condition
+        plt.figure(figsize=(12, 8))
+        conditions = metrics_df['condition'].unique()
+        
+        for condition in conditions:
+            condition_data = metrics_df[metrics_df['condition'] == condition]['area']
+            plt.hist(condition_data, alpha=0.5, bins=30, label=condition)
+        
+        plt.title('Cell Area Distribution by Condition')
+        plt.xlabel('Cell Area (pixels)')
+        plt.ylabel('Count')
+        plt.legend()
+        plt.grid(alpha=0.3)
+        
+        # Save and log figure
+        area_hist_path = figures_dir / "cell_area_histogram.png"
+        plt.savefig(area_hist_path)
+        safe_log_artifact(area_hist_path, "figures")
+        plt.close()
+        
+        # 2. Create bar chart of cell counts by condition (before and after gating)
+        plt.figure(figsize=(10, 6))
+        
+        # Count cells by condition
+        condition_counts = metrics_df['condition'].value_counts()
+        gated_condition_counts = gated_metrics_df['condition'].value_counts()
+        
+        # Ensure all conditions are represented in gated counts
+        for condition in condition_counts.index:
+            if condition not in gated_condition_counts:
+                gated_condition_counts[condition] = 0
+        
+        # Sort both series by the same order
+        gated_condition_counts = gated_condition_counts.reindex(condition_counts.index)
+        
+        # Create bar chart
+        x = np.arange(len(condition_counts))
+        width = 0.35
+        
+        fig, ax = plt.subplots(figsize=(12, 8))
+        ax.bar(x - width/2, condition_counts, width, label='All Cells')
+        ax.bar(x + width/2, gated_condition_counts, width, label='Gated Cells')
+        
+        ax.set_title('Cell Counts by Condition (Before and After Gating)')
+        ax.set_xlabel('Condition')
+        ax.set_ylabel('Count')
+        ax.set_xticks(x)
+        ax.set_xticklabels(condition_counts.index)
+        ax.legend()
+        ax.grid(alpha=0.3)
+        
+        # Add count labels on top of bars
+        for i, v in enumerate(condition_counts):
+            ax.text(i - width/2, v + 5, str(v), ha='center')
+            
+        for i, v in enumerate(gated_condition_counts):
+            ax.text(i + width/2, v + 5, str(v), ha='center')
+        
+        # Save and log figure
+        count_bar_path = figures_dir / "cell_count_by_condition.png"
+        plt.savefig(count_bar_path)
+        safe_log_artifact(count_bar_path, "figures")
+        plt.close()
+        
+        # 3. Create scatter plot of cell metrics (e.g., area vs. circularity)
+        if 'circularity' in metrics_df.columns:
+            plt.figure(figsize=(12, 8))
+            
+            for condition in conditions:
+                condition_data = metrics_df[metrics_df['condition'] == condition]
+                plt.scatter(
+                    condition_data['area'], 
+                    condition_data['circularity'],
+                    alpha=0.5,
+                    label=condition
+                )
+            
+            plt.title('Cell Area vs. Circularity by Condition')
+            plt.xlabel('Cell Area (pixels)')
+            plt.ylabel('Circularity')
+            plt.legend()
+            plt.grid(alpha=0.3)
+            
+            # Save and log figure
+            scatter_path = figures_dir / "area_vs_circularity.png"
+            plt.savefig(scatter_path)
+            safe_log_artifact(scatter_path, "figures")
+            plt.close()
+        
+        # Return the directory containing the figures
+        return figures_dir
+        
+    except Exception as e:
+        logger.warning(f"Failed to create summary figures: {str(e)}")
+        return None
+
 def main():
     try:
         # Parse command line arguments
@@ -376,6 +681,53 @@ def main():
         # Create unique run output directory
         run_output_dir, run_id = create_run_output_dir(base_output_dir)
         
+        # Set up MLflow tracking if enabled
+        mlflow_run = None
+        if args.log_to_mlflow:
+            print(f"\nSetting up MLflow tracking at {args.tracking_uri}")
+            mlflow.set_tracking_uri(args.tracking_uri)
+            
+            # Set up S3/MinIO credentials for MLflow if provided
+            if args.aws_access_key_id and args.aws_secret_access_key and args.s3_endpoint_url:
+                os.environ["AWS_ACCESS_KEY_ID"] = args.aws_access_key_id
+                os.environ["AWS_SECRET_ACCESS_KEY"] = args.aws_secret_access_key
+                os.environ["MLFLOW_S3_ENDPOINT_URL"] = args.s3_endpoint_url
+                os.environ["MLFLOW_S3_IGNORE_TLS"] = "true"
+            
+            # Create or set experiment
+            experiment = mlflow.set_experiment(args.inference_experiment_name)
+            
+            # Start MLflow run
+            mlflow_run = mlflow.start_run(
+                run_name=f"inference_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                description=f"Inference on project: {project_dir.name}"
+            )
+            
+            # Log parameters
+            mlflow.log_params({
+                "project_dir": str(project_dir),
+                "output_dir": str(run_output_dir),
+                "device": args.device,
+                "num_pipelines": args.num_pipelines,
+                "run_id": run_id,
+            })
+            
+            # Log model source information
+            if args.model_name:
+                mlflow.log_params({
+                    "model_source": "registry",
+                    "model_name": args.model_name,
+                    "model_version": args.model_version or "latest",
+                })
+            else:
+                mlflow.log_params({
+                    "model_source": "mlflow_run",
+                    "source_experiment_id": args.experiment_id,
+                    "source_run_id": args.run_id,
+                })
+            
+            print(f"MLflow tracking initialized - Run ID: {mlflow_run.info.run_id}")
+        
         # Get all condition directories
         condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
         
@@ -385,6 +737,11 @@ def main():
         print("Click two points on each image to define the min and max X coordinates.")
         roi_coordinates = get_roi_coordinates_web(condition_dirs, run_output_dir)
         print("\nROI coordinates collected successfully!")
+        
+        # Log ROI selection to MLflow if enabled
+        if args.log_to_mlflow and mlflow_run:
+            print("\nLogging ROI selection to MLflow...")
+            log_roi_selection_to_mlflow(condition_dirs, roi_coordinates, run_output_dir)
         
         print(f"\nInitializing pipeline... [Run ID: {run_id}]")
         # Get model path from MLflow
@@ -478,11 +835,71 @@ def main():
         )
         print_summary(combined_results, total_runtime)
         
+        # Log metrics and artifacts to MLflow if enabled
+        if args.log_to_mlflow and mlflow_run:
+            # Log metrics
+            mlflow.log_metric("total_runtime_seconds", total_runtime)
+            mlflow.log_metric("total_images_processed", total_images)
+            mlflow.log_metric("total_cells_detected", combined_results.total_timing["total_cells"])
+            mlflow.log_metric("avg_cells_per_image", combined_results.total_timing["total_cells"] / total_images if total_images > 0 else 0)
+            
+            # Log timing metrics
+            for key, value in combined_results.total_timing.items():
+                if key != "total_cells":  # Skip non-timing metrics
+                    mlflow.log_metric(f"timing_{key}_seconds", value)
+            
+            # Log condition-specific metrics
+            condition_counts = metrics_df['condition'].value_counts().to_dict()
+            for condition, count in condition_counts.items():
+                mlflow.log_metric(f"cells_in_{condition}", count)
+                
+                # Log gated cell counts
+                gated_count = len(gated_metrics_df[gated_metrics_df['condition'] == condition])
+                mlflow.log_metric(f"gated_cells_in_{condition}", gated_count)
+            
+            # Log artifacts with safe function
+            safe_log_artifact(run_output_dir / 'cell_metrics.csv')
+            safe_log_artifact(run_output_dir / 'gated_cell_metrics.csv')
+            safe_log_artifact(run_output_dir / 'roi_coordinates.json')
+            safe_log_artifact(run_output_dir / 'run_summary.txt')
+            
+            # Log condition-specific artifacts
+            for condition_dir in run_output_dir.iterdir():
+                if condition_dir.is_dir() and condition_dir.name in roi_coordinates:
+                    # Log the condition summary file if it exists
+                    summary_file = condition_dir / f"{condition_dir.name}_summary.txt"
+                    safe_log_artifact(summary_file, f"conditions/{condition_dir.name}")
+                    
+                    # Log the condition metrics file
+                    metrics_file = condition_dir / "cell_metrics.csv"
+                    safe_log_artifact(metrics_file, f"conditions/{condition_dir.name}")
+                    
+                    # Log the gated metrics file
+                    gated_metrics_file = condition_dir / "gated_cell_metrics.csv"
+                    safe_log_artifact(gated_metrics_file, f"conditions/{condition_dir.name}")
+            
+            # Create and log summary figures
+            print("\nCreating and logging summary figures...")
+            figures_dir = create_and_log_summary_figures(metrics_df, gated_metrics_df, run_output_dir)
+            
+            # Log visualization images
+            print("\nLogging visualization samples to MLflow...")
+            log_visualizations_to_mlflow(run_output_dir)
+            
+            # End MLflow run
+            mlflow.end_run()
+            print(f"\nMLflow tracking completed - Run ID: {mlflow_run.info.run_id}")
+            print(f"View run details at: {args.tracking_uri}/#/experiments/{experiment.experiment_id}/runs/{mlflow_run.info.run_id}")
+        
         print(f"\nResults saved to: {run_output_dir}")
         print(f"ROI coordinates saved to: {run_output_dir}/roi_coordinates.json")
         print("Gated metrics files have been created for each condition and the overall results.")
         
     except Exception as e:
+        # End MLflow run if active
+        if 'mlflow_run' in locals() and mlflow_run:
+            mlflow.end_run(status="FAILED")
+        
         logger.error(f"An error occurred during pipeline execution: {str(e)}", exc_info=True)
         raise
 

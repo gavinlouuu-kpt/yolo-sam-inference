@@ -19,7 +19,7 @@ def load_model_from_mlflow(experiment_id: str, run_id: str) -> str:
     logger.info(f"Loading model from MLflow - Experiment ID: {experiment_id}, Run ID: {run_id}")
     
     # Set up MLflow tracking URI from environment or use default
-    tracking_uri = os.getenv('MLFLOW_TRACKING_URI', 'file:///D:/code/ai_cytometry/yolo-sam-training/mlruns')
+    tracking_uri = os.getenv('MLFLOW_TRACKING_URI', 'http://localhost:5000')
     logger.info(f"Using MLflow tracking URI: {tracking_uri}")
     mlflow.set_tracking_uri(tracking_uri)
     
