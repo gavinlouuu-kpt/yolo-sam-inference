@@ -25,7 +25,7 @@ from yolo_sam_inference.utils import (
 )
 
 # Set up logger
-logger = setup_logger(__name__)
+logger = setup_logger(name=__name__)
 logger.setLevel('INFO')
 
 def parse_args():
@@ -411,7 +411,8 @@ def process_directory(
     input_dir: Path,
     output_base: Path,
     yolo_model,
-    use_roi: bool = False
+    use_roi: bool = False,
+    base_input_dir: Path = None
 ) -> None:
     """Process a single directory of images.
     
@@ -420,10 +421,24 @@ def process_directory(
         output_base: Base directory for output
         yolo_model: YOLO model for detection
         use_roi: Whether to use interactive ROI selection
+        base_input_dir: The original base input directory (for recursive mode)
     """
     # Create output directory for this specific input directory
-    rel_path = input_dir.relative_to(input_dir.parent)
-    dir_output = output_base / rel_path
+    # In recursive mode, preserve the subdirectory structure
+    if base_input_dir is not None:
+        try:
+            # Get relative path from the base input directory
+            rel_path = input_dir.relative_to(base_input_dir)
+            dir_output = output_base / rel_path
+        except ValueError:
+            # Fallback if relative_to fails
+            dir_output = output_base / input_dir.name
+    else:
+        # Default behavior for non-recursive mode
+        rel_path = input_dir.relative_to(input_dir.parent)
+        dir_output = output_base / rel_path
+    
+    logger.info(f"Output directory: {dir_output}")
     
     # Find image files
     image_files = []
@@ -517,7 +532,8 @@ def main():
                 input_dir=dir_path,
                 output_base=output_dir,
                 yolo_model=yolo_model,
-                use_roi=False  # Always use whole image in recursive mode
+                use_roi=False,  # Always use whole image in recursive mode
+                base_input_dir=input_dir
             )
     else:
         # Single directory processing (original behavior)

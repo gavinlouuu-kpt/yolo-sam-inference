@@ -6,6 +6,7 @@ Supports recursive directory traversal with the --recursive flag.
 
 import os
 import argparse
+import re
 from pathlib import Path
 from PIL import Image
 import logging
@@ -17,6 +18,46 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+def sanitize_filename(filename):
+    """
+    Sanitize a filename by removing or replacing invalid characters.
+    
+    Args:
+        filename (str): The filename to sanitize
+        
+    Returns:
+        str: Sanitized filename
+    """
+    # Replace invalid characters with underscores
+    # Windows has restrictions on these characters: \ / : * ? " < > |
+    # Also handle other potentially problematic characters like %, $, @, !, ^, &, etc.
+    sanitized = re.sub(r'[\\/*?:"<>|%$@!^&=+.,;]', '_', filename)
+    
+    # Replace multiple consecutive periods with a single underscore
+    # (keeping single periods for file extensions)
+    sanitized = re.sub(r'\.{2,}', '_', sanitized)
+    
+    # Replace spaces with underscores
+    sanitized = sanitized.replace(' ', '_')
+    
+    # Remove leading/trailing whitespace and periods
+    sanitized = sanitized.strip().strip('.')
+    
+    # Ensure the filename doesn't start with a dash or parenthesis
+    # as these can cause issues with command-line operations
+    sanitized = re.sub(r'^[-()]', '_', sanitized)
+    
+    # Limit length to avoid issues with long filenames
+    max_length = 240  # Safe limit for most filesystems
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length]
+    
+    # If filename becomes empty after sanitization, use a default name
+    if not sanitized:
+        sanitized = "unnamed_file"
+        
+    return sanitized
 
 def convert_tiff_to_png(tiff_path, output_dir=None):
     """
@@ -33,13 +74,16 @@ def convert_tiff_to_png(tiff_path, output_dir=None):
     try:
         # Open the TIFF image
         with Image.open(tiff_path) as img:
+            # Sanitize the filename
+            sanitized_stem = sanitize_filename(tiff_path.stem)
+            
             # Determine output path
             if output_dir:
                 output_dir = Path(output_dir)
                 output_dir.mkdir(parents=True, exist_ok=True)
-                png_path = output_dir / f"{tiff_path.stem}.png"
+                png_path = output_dir / f"{sanitized_stem}.png"
             else:
-                png_path = tiff_path.with_suffix('.png')
+                png_path = tiff_path.parent / f"{sanitized_stem}.png"
             
             # Save as PNG
             img.save(png_path, "PNG")
