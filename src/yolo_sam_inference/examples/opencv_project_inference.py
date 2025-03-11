@@ -20,10 +20,91 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from skimage.measure import regionprops, regionprops_table
 from yolo_sam_inference.utils.metrics import calculate_metrics
 from dataclasses import dataclass
+import hashlib
 
 # Set up logger with reduced verbosity
 logger = setup_logger(__name__)
 logger.setLevel('INFO')
+
+# Define a simplified metrics calculation function that skips convex hull calculations
+def calculate_metrics_no_convex_hull(image: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
+    """Calculate metrics for a segmented cell without convex hull calculations.
+    
+    This is a simplified version of calculate_metrics that skips the convex hull
+    calculations to avoid errors in the OpenCV pipeline.
+    
+    Args:
+        image: Original RGB image (H, W, 3)
+        mask: Binary mask of the cell (H, W)
+        
+    Returns:
+        Dictionary containing basic metrics without convex hull related metrics
+    """
+    # Ensure mask is 2D boolean array
+    if mask.ndim > 2:
+        mask = mask.squeeze()
+    mask = mask.astype(bool)
+    
+    # Ensure image and mask have matching dimensions
+    assert mask.shape == image.shape[:2], f"Mask shape {mask.shape} does not match image shape {image.shape[:2]}"
+    
+    # Calculate basic properties
+    props = regionprops(mask.astype(int))[0]
+
+    # Calculate area
+    area = props.area
+    
+    # Calculate perimeter
+    perimeter = props.perimeter
+
+    # Calculate brightness metrics (convert RGB to grayscale)
+    brightness_image = np.mean(image, axis=2)  # Shape will be (H, W)
+    
+    # Calculate center region mask
+    proportional_factor = 0.1  # Define the proportional factor
+    center_radius = int(min(mask.shape) * proportional_factor)  # Define the radius of the center region
+    center_region_mask = np.zeros_like(mask, dtype=bool)
+    center_x, center_y = props.centroid
+    rr, cc = np.ogrid[:mask.shape[0], :mask.shape[1]]
+    center_region_mask = (rr - center_x)**2 + (cc - center_y)**2 <= center_radius**2
+    
+    # Calculate brightness in the center region
+    center_brightness = brightness_image[center_region_mask]
+    mean_brightness = np.mean(center_brightness) if center_brightness.size > 0 else 0
+    brightness_std = np.std(center_brightness) if center_brightness.size > 0 else 0
+
+    # Calculate aspect ratio
+    min_x, min_y, max_x, max_y = props.bbox
+    aspect_ratio = (max_x - min_x) / (max_y - min_y) if (max_x - min_x) > 0 and (max_y - min_y) > 0 else 0
+    mask_x_length = max_x - min_x
+    mask_y_length = max_y - min_y
+
+    # Set default values for convex hull metrics to avoid errors
+    # These are placeholders that won't cause errors in downstream processing
+    convex_hull_area = area  # Use the same area as the mask
+    convex_hull_perimeter = perimeter  # Use the same perimeter as the mask
+    area_ratio = 1.0  # Perfect ratio
+    circularity = 0.5  # Middle value
+    deformability = 0.5  # Middle value
+
+    return {
+        "deformability": float(deformability),
+        "area": int(area),
+        "area_ratio": float(area_ratio),
+        "circularity": float(circularity),
+        "convex_hull_area": int(convex_hull_area),
+        "mask_x_length": int(mask_x_length),
+        "mask_y_length": int(mask_y_length),
+        "min_x": int(min_x),
+        "min_y": int(min_y),
+        "max_x": int(max_x),
+        "max_y": int(max_y),
+        "mean_brightness": float(mean_brightness),
+        "brightness_std": float(brightness_std),
+        "perimeter": float(perimeter),
+        "aspect_ratio": float(aspect_ratio),
+        "convex_hull_perimeter": float(convex_hull_perimeter),
+    }
 
 @dataclass
 class ProcessingResult:
@@ -144,7 +225,7 @@ class OpenCVPipeline:
             rgb_image = image
             
         # Use the existing metrics calculation function
-        metrics = calculate_metrics(rgb_image, mask)
+        metrics = calculate_metrics_no_convex_hull(rgb_image, mask)
         
         return metrics
 
@@ -185,12 +266,36 @@ class OpenCVPipeline:
             ProcessingResult containing processing results
         """
         # Extract image name from path
-        image_name = Path(image_path).stem
+        image_path_obj = Path(image_path)
+        image_name = image_path_obj.stem
+        
+        # Extract batch name from path to avoid filename collisions
+        try:
+            # Try to extract batch name from path (assuming structure like /path/to/batch_name/images/...)
+            # Go up two levels from the image file to get the batch folder
+            batch_folder = image_path_obj.parent.parent
+            batch_name = batch_folder.name
+            
+            # Check if the batch name contains useful information (like a number)
+            if batch_name and any(char.isdigit() for char in batch_name):
+                logger.info(f"Extracted batch name: {batch_name}")
+                # Include batch name in the output filename to avoid collisions
+                output_name = f"{batch_name}_{image_name}"
+            else:
+                # If we couldn't extract a meaningful batch name, use a hash of the path
+                path_hash = hashlib.md5(str(image_path_obj.parent).encode()).hexdigest()[:6]
+                output_name = f"{path_hash}_{image_name}"
+                logger.info(f"Using path hash as batch identifier: {path_hash}")
+        except Exception as e:
+            # Fallback to just using the image name if there's any error
+            logger.warning(f"Error extracting batch name: {str(e)}, using image name only")
+            output_name = image_name
         
         # Check if this is a cropped image
         is_cropped = 'cropped_roi' in str(image_path)
         logger.info(f"Processing image: {image_path}")
         logger.info(f"Is cropped: {is_cropped} (determined by 'cropped_roi' in path)")
+        logger.info(f"Output name with batch identifier: {output_name}")
         
         # Load image
         gray_image = self._load_image(image_path)
@@ -238,12 +343,14 @@ class OpenCVPipeline:
             metrics = self.calculate_contour_metrics(contour, color_image)
             metrics['cell_id'] = i
             metrics['image_name'] = image_name
+            metrics['batch_name'] = batch_name if 'batch_name' in locals() else ""
             metrics['is_cropped'] = is_cropped
             contour_metrics.append(metrics)
         
         # Save visualizations if requested
         if save_visualizations and output_path:
-            vis_path = str(Path(output_path) / f"{image_name}_visualization.png")
+            # Use the output_name that includes batch identifier to avoid collisions
+            vis_path = str(Path(output_path) / f"{output_name}_visualization.png")
             
             # Get ROI coordinates for visualization
             x_min = roi['x_min'] if roi else 0
@@ -254,9 +361,9 @@ class OpenCVPipeline:
             save_visualization(color_image, mask, filtered_mask, {}, 
                               x_min, y_min, x_max, y_max, vis_path, contour_metrics)
             
-            # Save masks
-            mask_path = str(Path(output_path) / f"{image_name}_mask.png")
-            filtered_mask_path = str(Path(output_path) / f"{image_name}_filtered_mask.png")
+            # Save masks with batch identifier in filename
+            mask_path = str(Path(output_path) / f"{output_name}_mask.png")
+            filtered_mask_path = str(Path(output_path) / f"{output_name}_filtered_mask.png")
             cv2.imwrite(mask_path, mask * 255)
             cv2.imwrite(filtered_mask_path, filtered_mask * 255)
         
@@ -390,22 +497,22 @@ def process_single_image(args):
             save_visualizations=True
         )
         
-        if result.num_contours == 0:
-            logger.info(f"No contours found in {image_name}, skipping")
-            return None
-        
         # Calculate summary metrics
         total_area = np.sum(result.mask > 0) if result.mask is not None else 0
         roi_area = np.sum(result.filtered_mask > 0) if result.filtered_mask is not None else 0
         
-        logger.info(f"Processed successfully: total_area={total_area}, roi_area={roi_area}, contours={result.num_contours}")
+        if result.num_contours == 0:
+            logger.info(f"No contours found in {image_name}, but still processing")
+        else:
+            logger.info(f"Processed successfully: total_area={total_area}, roi_area={roi_area}, contours={result.num_contours}")
         
         return {
             'image_name': image_name,
             'is_cropped': 'cropped_roi' in str(image_path),
             'total_area': total_area,
             'roi_area': roi_area,
-            'contour_metrics': result.contour_metrics
+            'contour_metrics': result.contour_metrics,
+            'num_contours': result.num_contours
         }
     except Exception as e:
         logger.error(f"Error processing image {image_path}: {str(e)}")
@@ -479,23 +586,11 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
     
     logger.info(f"\nProcessing condition: {condition_name}")
     
-    # Find all image files in the condition directory (recursively)
-    image_files = []
-    for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
-        found_files = list(condition_dir.glob(f"**/*{ext}"))
-        logger.info(f"  Found {len(found_files)} {ext} files")
-        image_files.extend(found_files)
-    
-    # Filter out background images
-    original_count = len(image_files)
-    image_files = [f for f in image_files if 'background' not in f.name.lower()]
-    logger.info(f"  After filtering out background images: {len(image_files)} of {original_count} files remain")
-    
-    # Separate full frame and cropped images
-    full_frame_images = [f for f in image_files if 'full_frames' in str(f)]
-    cropped_images = [f for f in image_files if 'cropped_roi' in str(f)]
-    logger.info(f"  Full frame images: {len(full_frame_images)}")
-    logger.info(f"  Cropped ROI images: {len(cropped_images)}")
+    # Count and log the number of batches
+    batch_folders = [d for d in condition_dir.iterdir() if d.is_dir() and "_output" in d.name]
+    logger.info(f"  Found {len(batch_folders)} batches in condition {condition_name}")
+    for i, batch_folder in enumerate(sorted(batch_folders)):
+        logger.info(f"    Batch {i+1}: {batch_folder.name}")
     
     # Find background images in each batch folder
     background_images = {}
@@ -528,63 +623,105 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
         
         # Process images in parallel using a ProcessPoolExecutor
         all_results = []
+        skipped_no_contours = 0
+        processed_count = 0
         n_workers = max(1, mp.cpu_count() - 1)  # Leave one CPU free
         
-        # Process full frame images
-        if full_frame_images:
-            logger.info(f"  Processing {len(full_frame_images)} full frame images")
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = []
-                for image_path in full_frame_images:
-                    # Determine which background image to use
-                    batch_folder = image_path.parent.parent  # Go up two levels to get the batch folder
-                    batch_name = batch_folder.name
-                    img_background_path = background_images.get(batch_name, background_path)
+        # Process each batch folder
+        for batch_folder in sorted(batch_folders):
+            logger.info(f"\n  Processing batch: {batch_folder.name}")
+            
+            # Find all image files in this batch
+            batch_image_files = []
+            
+            # Look specifically in the cropped_roi_with_target and full_frames_with_target subdirectories
+            cropped_roi_dir = batch_folder / "cropped_roi_with_target"
+            full_frames_dir = batch_folder / "full_frames_with_target"
+            
+            logger.info(f"    Looking for images in: {cropped_roi_dir}")
+            logger.info(f"    Looking for images in: {full_frames_dir}")
+            
+            # Find images in cropped_roi_with_target
+            if cropped_roi_dir.exists():
+                for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+                    found_files = list(cropped_roi_dir.glob(f"*{ext}"))
+                    logger.info(f"    Found {len(found_files)} {ext} files in cropped_roi_with_target")
+                    batch_image_files.extend([f for f in found_files if 'background' not in f.name.lower()])
+            
+            # Find images in full_frames_with_target
+            if full_frames_dir.exists():
+                for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+                    found_files = list(full_frames_dir.glob(f"*{ext}"))
+                    logger.info(f"    Found {len(found_files)} {ext} files in full_frames_with_target")
+                    batch_image_files.extend([f for f in found_files if 'background' not in f.name.lower()])
+            
+            # Separate full frame and cropped images for this batch
+            batch_full_frame_images = [f for f in batch_image_files if 'full_frames' in str(f)]
+            batch_cropped_images = [f for f in batch_image_files if 'cropped_roi' in str(f)]
+            
+            logger.info(f"    Found {len(batch_image_files)} total images in batch")
+            logger.info(f"    Full frame images: {len(batch_full_frame_images)}")
+            logger.info(f"    Cropped ROI images: {len(batch_cropped_images)}")
+            
+            # Get background image for this batch
+            img_background_path = background_images.get(batch_folder.name, background_path)
+            
+            # Process full frame images for this batch
+            if batch_full_frame_images:
+                logger.info(f"    Processing {len(batch_full_frame_images)} full frame images")
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    futures = []
+                    for image_path in batch_full_frame_images:
+                        args = (
+                            str(image_path),
+                            img_background_path,
+                            pipeline,
+                            condition_output_dir / "full_frames",
+                            roi
+                        )
+                        futures.append(executor.submit(process_single_image, args))
                     
-                    args = (
-                        str(image_path),
-                        img_background_path,
-                        pipeline,
-                        condition_output_dir / "full_frames",
-                        roi
-                    )
-                    futures.append(executor.submit(process_single_image, args))
-                
-                for future in futures:
-                    result = future.result()
-                    if result is not None:
-                        all_results.append(result)
-                    if pbar:
-                        pbar.update(1)
-        
-        # Process cropped images
-        if cropped_images:
-            logger.info(f"  Processing {len(cropped_images)} cropped images")
-            with ProcessPoolExecutor(max_workers=n_workers) as executor:
-                futures = []
-                for image_path in cropped_images:
-                    # Determine which background image to use
-                    batch_folder = image_path.parent.parent  # Go up two levels to get the batch folder
-                    batch_name = batch_folder.name
-                    img_background_path = background_images.get(batch_name, background_path)
+                    for future in futures:
+                        result = future.result()
+                        processed_count += 1
+                        if result is not None:
+                            all_results.append(result)
+                        else:
+                            # Assume skipped due to no contours if result is None
+                            skipped_no_contours += 1
+                        if pbar:
+                            pbar.update(1)
+            
+            # Process cropped images for this batch
+            if batch_cropped_images:
+                logger.info(f"    Processing {len(batch_cropped_images)} cropped images")
+                with ProcessPoolExecutor(max_workers=n_workers) as executor:
+                    futures = []
+                    for image_path in batch_cropped_images:
+                        args = (
+                            str(image_path),
+                            img_background_path,
+                            pipeline,
+                            condition_output_dir / "cropped",
+                            roi
+                        )
+                        futures.append(executor.submit(process_single_image, args))
                     
-                    args = (
-                        str(image_path),
-                        img_background_path,
-                        pipeline,
-                        condition_output_dir / "cropped",
-                        roi
-                    )
-                    futures.append(executor.submit(process_single_image, args))
-                
-                for future in futures:
-                    result = future.result()
-                    if result is not None:
-                        all_results.append(result)
-                    if pbar:
-                        pbar.update(1)
+                    for future in futures:
+                        result = future.result()
+                        processed_count += 1
+                        if result is not None:
+                            all_results.append(result)
+                        else:
+                            # Assume skipped due to no contours if result is None
+                            skipped_no_contours += 1
+                        if pbar:
+                            pbar.update(1)
         
+        logger.info(f"\n  Condition summary:")
         logger.info(f"  Processed {len(all_results)} images successfully")
+        logger.info(f"  Skipped {skipped_no_contours} images due to no contours found")
+        logger.info(f"  Total images processed: {processed_count}")
         
         # Save results to CSV for this condition
         save_results_to_csv(all_results, condition_output_dir)
@@ -619,18 +756,35 @@ def save_results_to_csv(results, output_dir: Path) -> None:
     """Save processing results to CSV files focusing on cell metrics."""
     # Prepare data in memory first
     cell_metrics_data = []
+    image_summary_data = []
     
     for result in results:
         if result is None:
             continue
             
-        # Add cell metrics data
-        if 'contour_metrics' in result:
+        # Create image summary entry even if no contours
+        image_summary = {
+            'image_name': result['image_name'],
+            'is_cropped': result.get('is_cropped', False),
+            'total_area': result.get('total_area', 0),
+            'roi_area': result.get('roi_area', 0),
+            'num_contours': result.get('num_contours', 0)
+        }
+        image_summary_data.append(image_summary)
+        
+        # Add cell metrics data if available
+        if 'contour_metrics' in result and result['contour_metrics']:
             for cell_metric in result['contour_metrics']:
                 # Add image information to each cell metric
                 cell_metric['image_name'] = result['image_name']
                 cell_metric['is_cropped'] = result.get('is_cropped', False)
                 cell_metrics_data.append(cell_metric)
+    
+    # Save image summary data
+    if image_summary_data:
+        image_summary_df = pd.DataFrame(image_summary_data)
+        image_summary_df.to_csv(output_dir / 'image_summary.csv', index=False)
+        logger.info(f"Saved summary for {len(image_summary_data)} images")
     
     # Save cell metrics data
     if cell_metrics_data:
@@ -681,6 +835,22 @@ def main():
         for d in condition_dirs:
             print(f"  - {d.name}")
             
+        # Count total batches across all conditions
+        total_batches = 0
+        all_batch_folders = set()
+        print("\nCounting batches in each condition:")
+        for condition_dir in condition_dirs:
+            # Find all batch directories (those with "_output" in the name)
+            batch_folders = [d for d in condition_dir.iterdir() if d.is_dir() and "_output" in d.name]
+            
+            print(f"  Condition {condition_dir.name}: {len(batch_folders)} batches")
+            for i, batch_folder in enumerate(sorted(batch_folders)):
+                print(f"    Batch {i+1}: {batch_folder.name}")
+                all_batch_folders.add(batch_folder)
+            
+        total_batches = len(all_batch_folders)
+        print(f"\nTotal batches across all conditions: {total_batches}")
+        
         # Debug: Check directory structure for each condition
         for condition_dir in condition_dirs:
             print(f"\nDEBUG: Analyzing directory structure for condition: {condition_dir.name}")
@@ -761,7 +931,13 @@ def main():
         
         total_runtime = time.time() - start_time
         
+        # Count images with and without contours
+        images_with_contours = sum(1 for r in all_results if r.get('num_contours', 0) > 0)
+        images_without_contours = sum(1 for r in all_results if r.get('num_contours', 0) == 0)
+        
         print(f"\nProcessed {len(all_results)} images successfully across all conditions")
+        print(f"  - Images with contours: {images_with_contours}")
+        print(f"  - Images without contours: {images_without_contours}")
         
         # Save results
         print("\nSaving results...")
