@@ -189,6 +189,8 @@ class OpenCVPipeline:
         
         # Check if this is a cropped image
         is_cropped = 'cropped_roi' in str(image_path)
+        logger.info(f"Processing image: {image_path}")
+        logger.info(f"Is cropped: {is_cropped} (determined by 'cropped_roi' in path)")
         
         # Load image
         gray_image = self._load_image(image_path)
@@ -209,21 +211,26 @@ class OpenCVPipeline:
         
         # Apply ROI filtering if provided
         if roi is not None and not is_cropped:
+            logger.info(f"Applying ROI filtering with coordinates: {roi}")
             filtered_contours = self.filter_contours_by_roi(contours, gray_image.shape, roi)
             filtered_mask = self.contours_to_mask(filtered_contours, gray_image.shape)
+            logger.info(f"After ROI filtering: {len(filtered_contours)} of {len(contours)} contours remain")
         else:
             # For cropped images or when no ROI is provided, use all contours
+            logger.info(f"Skipping ROI filtering because {'image is cropped' if is_cropped else 'no ROI provided'}")
             filtered_contours = contours
             filtered_mask = mask
             
             # If this is a cropped image and ROI is provided, adjust ROI for visualization
             if is_cropped and roi is not None:
+                logger.info(f"Adjusting ROI for cropped image visualization")
                 roi = {
                     'x_min': 0,
                     'y_min': 0,
                     'x_max': gray_image.shape[1],
                     'y_max': gray_image.shape[0]
                 }
+                logger.info(f"Adjusted ROI: {roi}")
         
         # Calculate metrics for each contour
         contour_metrics = []
@@ -673,6 +680,25 @@ def main():
         print(f"Found {len(condition_dirs)} condition directories:")
         for d in condition_dirs:
             print(f"  - {d.name}")
+            
+        # Debug: Check directory structure for each condition
+        for condition_dir in condition_dirs:
+            print(f"\nDEBUG: Analyzing directory structure for condition: {condition_dir.name}")
+            # Check for cropped_roi and full_frames directories
+            cropped_dirs = list(condition_dir.glob("**/cropped_roi*"))
+            full_frame_dirs = list(condition_dir.glob("**/full_frame*"))
+            print(f"DEBUG:   Found {len(cropped_dirs)} directories with 'cropped_roi' in name")
+            print(f"DEBUG:   Found {len(full_frame_dirs)} directories with 'full_frame' in name")
+            
+            # Count image files in each type of directory
+            cropped_images = []
+            full_frame_images = []
+            for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+                cropped_images.extend(list(condition_dir.glob(f"**/cropped_roi*/**/*{ext}")))
+                full_frame_images.extend(list(condition_dir.glob(f"**/full_frame*/**/*{ext}")))
+            
+            print(f"DEBUG:   Found {len(cropped_images)} images in 'cropped_roi' directories")
+            print(f"DEBUG:   Found {len(full_frame_images)} images in 'full_frame' directories")
         
         print("\nOpening web interface for ROI selection...")
         print("Please select ROI coordinates for each condition in the browser window.")
@@ -680,6 +706,7 @@ def main():
         print("You must select ROI for ALL conditions before processing can begin.")
         
         # Get ROI coordinates
+        print("\nDEBUG: Calling get_roi_coordinates_web to select images for ROI selection")
         roi_coordinates = get_roi_coordinates_web(condition_dirs, run_output_dir)
         
         # Verify ROI coordinates

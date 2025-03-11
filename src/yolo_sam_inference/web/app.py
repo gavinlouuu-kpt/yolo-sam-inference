@@ -222,10 +222,42 @@ def get_roi_coordinates_web(
         if not image_files:
             print(f"DEBUG:   No valid images found in {condition_dir}, skipping")
             continue
+        
+        # Debug: Print all image paths to see what's available
+        print(f"DEBUG:   Available images after filtering:")
+        for i, img in enumerate(image_files[:5]):  # Show first 5 images
+            print(f"DEBUG:     {i}: {img}")
+        if len(image_files) > 5:
+            print(f"DEBUG:     ... and {len(image_files) - 5} more")
+            
+        # Sort images to prioritize full_frames over cropped_roi if possible
+        full_frame_images = [f for f in image_files if 'full_frames' in str(f)]
+        cropped_images = [f for f in image_files if 'cropped_roi' in str(f)]
+        print(f"DEBUG:   Found {len(full_frame_images)} full_frame images and {len(cropped_images)} cropped_roi images")
+        
+        # Select the image for ROI selection, prioritizing full_frames over cropped_roi
+        selected_image = None
+        selection_reason = ""
+        
+        if full_frame_images:
+            selected_image = full_frame_images[0]
+            selection_reason = "Prioritized full_frame image for ROI selection"
+        elif cropped_images:
+            selected_image = cropped_images[0]
+            selection_reason = "Using cropped_roi image for ROI selection (no full_frame images available)"
+        else:
+            selected_image = image_files[0]
+            selection_reason = "Using first available image (no full_frame or cropped_roi images found)"
+        
+        # Debug info about the selected image
+        is_cropped = 'cropped_roi' in str(selected_image)
+        print(f"DEBUG:   Selected image: {selected_image}")
+        print(f"DEBUG:   Is cropped: {is_cropped}")
+        print(f"DEBUG:   Selection reason: {selection_reason}")
             
         conditions.append(condition_dir.name)
-        first_images[condition_dir.name] = image_files[0]
-        print(f"DEBUG:   Added condition '{condition_dir.name}' with first image: {image_files[0]}")
+        first_images[condition_dir.name] = selected_image
+        print(f"DEBUG:   Added condition '{condition_dir.name}' with image: {selected_image}")
     
     print(f"DEBUG: Found {len(conditions)} valid conditions with images")
     if not conditions:
