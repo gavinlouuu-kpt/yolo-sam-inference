@@ -20,7 +20,8 @@ import numpy as np
 
 from yolo_sam_inference.utils import (
     setup_logger,
-    load_model_from_mlflow
+    load_model_from_mlflow,
+    load_model_from_registry
 )
 
 # Set up logger
@@ -49,17 +50,74 @@ def parse_args():
     )
     
     parser.add_argument(
+        '--roi',
+        action='store_true',
+        help='Enable interactive ROI selection. If not provided, the entire image will be used as ROI.'
+    )
+    
+    parser.add_argument(
+        '--recursive', '-r',
+        action='store_true',
+        help='Process all subdirectories recursively. Uses whole image as ROI for all directories.'
+    )
+    
+    # Model source group - either MLflow run or Model Registry
+    model_source_group = parser.add_mutually_exclusive_group(required=True)
+    
+    # MLflow run source (original method)
+    model_source_group.add_argument(
         '--experiment-id',
         type=str,
-        default="320489803004134590",
         help='MLflow experiment ID for loading YOLO model'
     )
     
     parser.add_argument(
         '--run-id',
         type=str,
-        default="c2fef8a01dea4fc4a8876414a90b3f69",
-        help='MLflow run ID for loading YOLO model'
+        help='MLflow run ID for loading YOLO model (required if experiment-id is provided)'
+    )
+    
+    # Model Registry source (new method)
+    model_source_group.add_argument(
+        '--model-name',
+        type=str,
+        help='Name of the registered model in MLflow Model Registry'
+    )
+    
+    parser.add_argument(
+        '--model-version',
+        type=str,
+        required=False,
+        help='Version of the registered model (if not specified, latest version will be used)'
+    )
+    
+    parser.add_argument(
+        '--registry-uri',
+        type=str,
+        default='http://localhost:5000',
+        help='URI of the MLflow Model Registry server'
+    )
+    
+    # S3/MinIO credentials
+    parser.add_argument(
+        '--aws-access-key-id',
+        type=str,
+        default='mibadmin',
+        help='AWS access key ID for S3/MinIO'
+    )
+    
+    parser.add_argument(
+        '--aws-secret-access-key',
+        type=str,
+        default='cuhkminio',
+        help='AWS secret access key for S3/MinIO'
+    )
+    
+    parser.add_argument(
+        '--s3-endpoint-url',
+        type=str,
+        default='http://localhost:9000',
+        help='S3/MinIO endpoint URL'
     )
     
     parser.add_argument(
@@ -92,6 +150,23 @@ def get_roi_coordinates(image_path: Path) -> Tuple[int, int, int, int]:
     cv2.destroyWindow(window_name)
     
     return roi  # Returns (x_min, y_min, width, height)
+
+def get_full_image_roi(image_path: Path) -> Tuple[int, int, int, int]:
+    """Get ROI coordinates for the entire image.
+    
+    Returns:
+        Tuple[int, int, int, int]: x_min, y_min, width, height for the entire image
+    """
+    # Read the image
+    image = cv2.imread(str(image_path))
+    if image is None:
+        raise ValueError(f"Could not read image: {image_path}")
+    
+    # Get image dimensions
+    height, width = image.shape[:2]
+    
+    # Return ROI for the entire image (x, y, width, height)
+    return (0, 0, width, height)
 
 def setup_output_dirs(output_base: Path) -> Tuple[Path, Path]:
     """Create and return output directory paths.
@@ -307,6 +382,79 @@ def process_frames(
     else:
         logger.warning("No frames without targets found - background frame not available")
 
+def find_image_directories(base_dir: Path) -> List[Path]:
+    """Find all directories containing images recursively.
+    
+    Args:
+        base_dir: Base directory to start search from
+        
+    Returns:
+        List[Path]: List of directories containing images
+    """
+    image_dirs = []
+    
+    # Check if the base directory itself contains images
+    image_extensions = ['.png', '.jpg', '.jpeg', '.tiff', '.tif']
+    has_images = any(base_dir.glob(f"*{ext}") for ext in image_extensions)
+    
+    if has_images:
+        image_dirs.append(base_dir)
+    
+    # Check subdirectories
+    for subdir in base_dir.iterdir():
+        if subdir.is_dir():
+            image_dirs.extend(find_image_directories(subdir))
+    
+    return image_dirs
+
+def process_directory(
+    input_dir: Path,
+    output_base: Path,
+    yolo_model,
+    use_roi: bool = False
+) -> None:
+    """Process a single directory of images.
+    
+    Args:
+        input_dir: Directory containing input frames
+        output_base: Base directory for output
+        yolo_model: YOLO model for detection
+        use_roi: Whether to use interactive ROI selection
+    """
+    # Create output directory for this specific input directory
+    rel_path = input_dir.relative_to(input_dir.parent)
+    dir_output = output_base / rel_path
+    
+    # Find image files
+    image_files = []
+    for ext in ['.png', '.jpg', '.jpeg', '.tiff', '.tif']:
+        image_files.extend(list(input_dir.glob(f"*{ext}")))
+    
+    if not image_files:
+        logger.warning(f"No image files found in directory: {input_dir}")
+        return
+    
+    # Get ROI coordinates
+    if use_roi:
+        logger.info(f"Processing directory: {input_dir}")
+        logger.info("Please select ROI in the opened window...")
+        roi_coords = get_roi_coordinates(image_files[0])
+        logger.info(f"Selected ROI: {roi_coords}")
+    else:
+        logger.info(f"Processing directory: {input_dir} (using entire image as ROI)")
+        roi_coords = get_full_image_roi(image_files[0])
+    
+    # Setup output directories
+    full_frames_dir, cropped_frames_dir = setup_output_dirs(dir_output)
+    
+    # Process frames
+    process_frames(
+        input_dir=input_dir,
+        output_dir=dir_output,
+        yolo_model=yolo_model,
+        roi_coords=roi_coords
+    )
+
 def main():
     """Main function to run the frame processing pipeline."""
     args = parse_args()
@@ -315,20 +463,36 @@ def main():
     # Set output directory to input directory + '_output' if not specified
     output_dir = Path(args.output_dir) if args.output_dir else input_dir.parent / f"{input_dir.name}_output"
     
-    # Check if input directory exists and contains images
+    # Check if input directory exists
     if not input_dir.exists():
         raise ValueError(f"Input directory does not exist: {input_dir}")
     
-    image_files = list(input_dir.glob("*.png")) + list(input_dir.glob("*.jpg")) + list(input_dir.glob("*.tiff"))
-    if not image_files:
-        raise ValueError(f"No image files found in input directory: {input_dir}")
-    
     # Load YOLO model
     logger.info("Loading YOLO model...")
-    model_path = load_model_from_mlflow(
-        experiment_id=args.experiment_id,
-        run_id=args.run_id
-    )
+    
+    # Determine model loading method based on provided arguments
+    if args.model_name:
+        # Load from Model Registry
+        logger.info(f"Loading model from MLflow Registry: {args.model_name} (version: {args.model_version or 'latest'})")
+        model_path = load_model_from_registry(
+            model_name=args.model_name,
+            model_version=args.model_version,
+            registry_uri=args.registry_uri,
+            aws_access_key_id=args.aws_access_key_id,
+            aws_secret_access_key=args.aws_secret_access_key,
+            s3_endpoint_url=args.s3_endpoint_url
+        )
+    else:
+        # Load from MLflow run (original method)
+        if not args.experiment_id or not args.run_id:
+            raise ValueError("Both experiment-id and run-id must be provided when loading from MLflow run")
+        
+        logger.info(f"Loading model from MLflow run: Experiment ID {args.experiment_id}, Run ID {args.run_id}")
+        model_path = load_model_from_mlflow(
+            experiment_id=args.experiment_id,
+            run_id=args.run_id
+        )
+    
     yolo_model = YOLO(model_path)
     
     # Set model device
@@ -337,21 +501,54 @@ def main():
     else:
         yolo_model.to('cpu')
     
-    # Get ROI coordinates using first image
-    logger.info("Please select ROI in the opened window...")
-    roi_coords = get_roi_coordinates(image_files[0])
-    
-    # Setup output directories
-    full_frames_dir, cropped_frames_dir = setup_output_dirs(output_dir)
-    
-    # Process frames
-    logger.info("Processing frames...")
-    process_frames(
-        input_dir=input_dir,
-        output_dir=output_dir,
-        yolo_model=yolo_model,
-        roi_coords=roi_coords
-    )
+    # Check if recursive mode is enabled
+    if args.recursive:
+        if args.roi:
+            logger.warning("ROI selection is disabled in recursive mode. Using whole image as ROI for all directories.")
+        
+        # Find all directories containing images
+        logger.info(f"Finding image directories recursively in: {input_dir}")
+        image_dirs = find_image_directories(input_dir)
+        logger.info(f"Found {len(image_dirs)} directories containing images")
+        
+        # Process each directory
+        for dir_path in tqdm(image_dirs, desc="Processing directories"):
+            process_directory(
+                input_dir=dir_path,
+                output_base=output_dir,
+                yolo_model=yolo_model,
+                use_roi=False  # Always use whole image in recursive mode
+            )
+    else:
+        # Single directory processing (original behavior)
+        image_files = []
+        for ext in ['.png', '.jpg', '.jpeg', '.tiff', '.tif']:
+            image_files.extend(list(input_dir.glob(f"*{ext}")))
+        
+        if not image_files:
+            raise ValueError(f"No image files found in input directory: {input_dir}")
+        
+        # Get ROI coordinates
+        if args.roi:
+            logger.info("Please select ROI in the opened window...")
+            roi_coords = get_roi_coordinates(image_files[0])
+            logger.info(f"Selected ROI: {roi_coords}")
+        else:
+            logger.info("Using entire image as ROI...")
+            roi_coords = get_full_image_roi(image_files[0])
+            logger.info(f"Full image ROI: {roi_coords}")
+        
+        # Setup output directories
+        full_frames_dir, cropped_frames_dir = setup_output_dirs(output_dir)
+        
+        # Process frames
+        logger.info("Processing frames...")
+        process_frames(
+            input_dir=input_dir,
+            output_dir=output_dir,
+            yolo_model=yolo_model,
+            roi_coords=roi_coords
+        )
     
     logger.info("Processing complete!")
 
