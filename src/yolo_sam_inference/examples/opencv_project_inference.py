@@ -135,26 +135,47 @@ class OpenCVPipeline:
         self.kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
         self._cached_backgrounds = {}  # Cache for processed backgrounds
 
-    def _process_background(self, background_path: str) -> np.ndarray:
-        """Process background image."""
+    def _process_background(self, background_path: str, is_cropped: bool = False, roi: Optional[Dict[str, int]] = None) -> np.ndarray:
+        """Process background image with optional cropping for ROI images."""
         if not background_path or not os.path.exists(background_path):
             logger.warning(f"Background image not found at {background_path}")
             return None
         
-        # Check if background is already cached
-        if background_path in self._cached_backgrounds:
-            return self._cached_backgrounds[background_path]
+        # Create a cache key that includes cropping information
+        cache_key = f"{background_path}_{is_cropped}_{str(roi) if roi else 'no_roi'}"
         
+        # Check if background is already cached
+        if cache_key in self._cached_backgrounds:
+            return self._cached_backgrounds[cache_key]
+        
+        # Load the background image
         background = cv2.imread(background_path, cv2.IMREAD_GRAYSCALE)
         if background is None:
             logger.warning(f"Failed to read background image at {background_path}")
             return None
         
+        # If this is for a cropped image and we have ROI coordinates and the background is a full frame
+        if is_cropped and roi and 'cropped_roi' not in background_path:
+            logger.info(f"Cropping full frame background to match ROI dimensions")
+            # Extract the ROI region from the background
+            x_min, y_min = roi['x_min'], roi['y_min']
+            x_max, y_max = roi['x_max'], roi['y_max']
+            
+            # Ensure coordinates are within bounds
+            x_min = max(0, x_min)
+            y_min = max(0, y_min)
+            x_max = min(background.shape[1], x_max)
+            y_max = min(background.shape[0], y_max)
+            
+            # Crop the background to the ROI
+            background = background[y_min:y_max, x_min:x_max]
+            logger.info(f"Cropped background to dimensions: {background.shape}")
+        
         # Apply blur to reduce noise
         background = cv2.GaussianBlur(background, self.blur_kernel_size, self.blur_sigma)
         
         # Cache the processed background
-        self._cached_backgrounds[background_path] = background
+        self._cached_backgrounds[cache_key] = background
         return background
 
     def _load_image(self, image_path: str) -> np.ndarray:
@@ -303,8 +324,8 @@ class OpenCVPipeline:
         # Load color image for visualization and metrics
         color_image = cv2.imread(image_path)
         
-        # Process background
-        background = self._process_background(background_path)
+        # Process background with appropriate cropping if needed
+        background = self._process_background(background_path, is_cropped, roi)
         
         # Detect contours
         contours, _ = self._detect_contours(gray_image, background)
@@ -594,14 +615,21 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
     
     # Find background images in each batch folder
     background_images = {}
+    cropped_background_images = {}  # New dictionary to store cropped background images
     for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
         for bg_file in condition_dir.glob(f"**/*background*{ext}"):
             batch_folder = bg_file.parent.parent  # Go up two levels to get the batch folder
             batch_name = batch_folder.name
-            background_images[batch_name] = str(bg_file)
-            logger.info(f"  Found background image for batch {batch_name}: {bg_file}")
+            
+            # Check if this is a cropped or full frame background
+            if 'cropped_roi' in str(bg_file):
+                cropped_background_images[batch_name] = str(bg_file)
+                logger.info(f"  Found cropped background image for batch {batch_name}: {bg_file}")
+            else:
+                background_images[batch_name] = str(bg_file)
+                logger.info(f"  Found full frame background image for batch {batch_name}: {bg_file}")
     
-    if not background_images:
+    if not background_images and not cropped_background_images:
         logger.warning(f"  No background images found")
         # Use the provided background path as fallback
         if background_path:
@@ -663,8 +691,14 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
             logger.info(f"    Full frame images: {len(batch_full_frame_images)}")
             logger.info(f"    Cropped ROI images: {len(batch_cropped_images)}")
             
-            # Get background image for this batch
-            img_background_path = background_images.get(batch_folder.name, background_path)
+            # Get background images for this batch
+            full_frame_bg_path = background_images.get(batch_folder.name, background_path)
+            
+            # For cropped images, prefer a cropped background if available, otherwise use full frame background
+            cropped_bg_path = cropped_background_images.get(batch_folder.name)
+            if not cropped_bg_path and full_frame_bg_path:
+                logger.info(f"    No cropped background found for batch {batch_folder.name}, will crop full frame background")
+                cropped_bg_path = full_frame_bg_path
             
             # Process full frame images for this batch
             if batch_full_frame_images:
@@ -674,7 +708,7 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
                     for image_path in batch_full_frame_images:
                         args = (
                             str(image_path),
-                            img_background_path,
+                            full_frame_bg_path,  # Use full frame background for full frame images
                             pipeline,
                             condition_output_dir / "full_frames",
                             roi
@@ -700,7 +734,7 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
                     for image_path in batch_cropped_images:
                         args = (
                             str(image_path),
-                            img_background_path,
+                            cropped_bg_path,  # Use cropped background for cropped images
                             pipeline,
                             condition_output_dir / "cropped",
                             roi
