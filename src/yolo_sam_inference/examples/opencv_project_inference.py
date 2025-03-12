@@ -505,6 +505,7 @@ def process_single_image(args):
         # Skip background images
         image_name = Path(image_path).stem
         if 'background' in image_name.lower():
+            logger.info(f"Skipping background image in process_single_image: {image_name}")
             return None
         
         logger.info(f"Processing image: {image_path}")
@@ -706,6 +707,11 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
                 with ProcessPoolExecutor(max_workers=n_workers) as executor:
                     futures = []
                     for image_path in batch_full_frame_images:
+                        # Skip background images at this stage to avoid unnecessary processing
+                        if 'background' in image_path.name.lower():
+                            logger.info(f"    Skipping background image: {image_path.name}")
+                            continue
+                            
                         args = (
                             str(image_path),
                             full_frame_bg_path,  # Use full frame background for full frame images
@@ -732,6 +738,11 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
                 with ProcessPoolExecutor(max_workers=n_workers) as executor:
                     futures = []
                     for image_path in batch_cropped_images:
+                        # Skip background images at this stage to avoid unnecessary processing
+                        if 'background' in image_path.name.lower():
+                            logger.info(f"    Skipping background image: {image_path.name}")
+                            continue
+                            
                         args = (
                             str(image_path),
                             cropped_bg_path,  # Use cropped background for cropped images
@@ -936,13 +947,16 @@ def main():
         total_images = 0
         for condition_dir in condition_dirs:
             for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
-                total_images += len(list(condition_dir.glob(f"**/*{ext}")))
+                # Find all images but exclude background images
+                image_files = [f for f in condition_dir.glob(f"**/*{ext}") if 'background' not in f.name.lower()]
+                total_images += len(image_files)
         
-        print(f"Found {total_images} total images across all conditions")
+        print(f"Found {total_images} total images (excluding backgrounds) across all conditions")
         
         # Process all conditions
         start_time = time.time()
         all_results = []
+        processed_image_count = 0  # Track the actual number of images processed
         
         with tqdm(total=total_images, desc="Processing images", unit="image") as pbar:
             # Process conditions sequentially for better debugging
@@ -959,6 +973,7 @@ def main():
                     )
                     if condition_results:
                         all_results.extend(condition_results)
+                        processed_image_count += len(condition_results)
                 except Exception as e:
                     logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
                     print(f"Error processing condition {condition_dir.name}: {str(e)}")
@@ -972,6 +987,12 @@ def main():
         print(f"\nProcessed {len(all_results)} images successfully across all conditions")
         print(f"  - Images with contours: {images_with_contours}")
         print(f"  - Images without contours: {images_without_contours}")
+        print(f"  - Progress bar total: {total_images}")
+        print(f"  - Actually processed: {processed_image_count}")
+        
+        # If there's a discrepancy, log it
+        if total_images != processed_image_count:
+            logger.warning(f"Progress bar discrepancy: Expected to process {total_images} images but actually processed {processed_image_count}")
         
         # Save results
         print("\nSaving results...")
