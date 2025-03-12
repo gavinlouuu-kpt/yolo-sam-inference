@@ -409,7 +409,14 @@ def parse_args():
         '--threshold',
         type=int,
         default=10,
-        help='Threshold value for binary thresholding'
+        help='Threshold value for binary thresholding (can be a comma-separated list of values)'
+    )
+    
+    parser.add_argument(
+        '--thresholds',
+        type=str,
+        default=None,
+        help='Comma-separated list of threshold values to run (e.g., "5,10,15")'
     )
     
     parser.add_argument(
@@ -725,9 +732,17 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, back
         traceback.print_exc()
         return []
 
-def create_run_output_dir(base_output_dir: Path) -> Tuple[Path, str]:
+def create_run_output_dir(base_output_dir: Path, threshold_value: int = None) -> Tuple[Path, str]:
     """Create a unique run output directory."""
-    run_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    unique_id = uuid.uuid4().hex[:8]
+    
+    # Include threshold value in the directory name if provided
+    if threshold_value is not None:
+        run_id = f"{timestamp}_th{threshold_value}_{unique_id}"
+    else:
+        run_id = f"{timestamp}_{unique_id}"
+        
     run_dir = base_output_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir, run_id
@@ -808,22 +823,37 @@ def save_results_to_csv(results, output_dir: Path) -> None:
             avg_deformability = sum(item.get('mean_deformability', 0) for item in summary_data) / len(summary_data)
             logger.info(f"Average deformability across all images: {avg_deformability:.4f}")
 
-def main():
-    try:
-        args = parse_args()
-        project_dir = Path(args.project_dir)
-        base_output_dir = Path(args.output_dir)
-        
-        if not project_dir.exists():
-            raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
-        
-        # Create output directory
-        run_output_dir, run_id = create_run_output_dir(base_output_dir)
-        
-        # Get condition directories
-        condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
-        print(f"Found {len(condition_dirs)} condition directories")
-            
+def run_pipeline_with_threshold(args, project_dir, base_output_dir, threshold_value, roi_coordinates=None):
+    """Run the pipeline with a specific threshold value."""
+    # Create output directory with threshold value in the name
+    run_output_dir, run_id = create_run_output_dir(base_output_dir, threshold_value)
+    
+    # Store pipeline parameters for this run
+    pipeline_params = {
+        "threshold": threshold_value,
+        "dilate_iterations": args.dilate,
+        "erode_iterations": args.erode,
+        "blur_kernel_size": args.blur,
+        "blur_sigma": args.sigma
+    }
+    
+    print(f"\n{'='*50}")
+    print(f"RUNNING PIPELINE WITH THRESHOLD {threshold_value}")
+    print(f"{'='*50}")
+    print(f"Run ID: {run_id}")
+    print(f"Pipeline parameters: threshold={threshold_value}, dilate={args.dilate}, erode={args.erode}, blur={args.blur}, sigma={args.sigma}")
+    
+    # Initialize pipeline with this threshold
+    pipeline = OpenCVPipeline(
+        threshold_value=threshold_value,
+        dilate_iterations=args.dilate,
+        erode_iterations=args.erode,
+        blur_kernel_size=(args.blur, args.blur),
+        blur_sigma=args.sigma
+    )
+    
+    # Get ROI coordinates if not provided (only do this once for the first threshold)
+    if roi_coordinates is None:
         print("\nOpening web interface for ROI selection...")
         print("Please select ROI coordinates for each condition in the browser window.")
         print("Click two points on each image to define the min and max X coordinates.")
@@ -838,104 +868,167 @@ def main():
             raise ValueError(f"Missing ROI coordinates for conditions: {', '.join(missing_conditions)}.")
             
         print("\nROI coordinates collected successfully for all conditions!")
+    else:
+        print("\nReusing ROI coordinates from previous run")
+    
+    # Count total images for progress bar
+    total_images = 0
+    print("Counting images to process...")
+    
+    for condition_dir in condition_dirs:
+        condition_image_count = 0
+        # Find batch folders
+        batch_folders = [d for d in condition_dir.iterdir() if d.is_dir() and "_output" in d.name]
         
-        print(f"\nInitializing OpenCV pipeline... [Run ID: {run_id}]")
-        pipeline = OpenCVPipeline(
-            threshold_value=args.threshold,
-            dilate_iterations=args.dilate,
-            erode_iterations=args.erode,
-            blur_kernel_size=(args.blur, args.blur),
-            blur_sigma=args.sigma
-        )
+        for batch_folder in batch_folders:
+            # Look specifically in the cropped_roi_with_target and full_frames_with_target subdirectories
+            cropped_roi_dir = batch_folder / "cropped_roi_with_target"
+            full_frames_dir = batch_folder / "full_frames_with_target"
+            
+            # Count images in cropped_roi_with_target
+            if cropped_roi_dir.exists():
+                for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+                    found_files = list(cropped_roi_dir.glob(f"*{ext}"))
+                    condition_image_count += len([f for f in found_files if 'background' not in f.name.lower()])
+            
+            # Count images in full_frames_with_target
+            if full_frames_dir.exists():
+                for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
+                    found_files = list(full_frames_dir.glob(f"*{ext}"))
+                    condition_image_count += len([f for f in found_files if 'background' not in f.name.lower()])
         
-        # Count total images for progress bar - more accurately this time
-        total_images = 0
-        print("Counting images to process...")
-        
+        total_images += condition_image_count
+        print(f"  - Condition {condition_dir.name}: {condition_image_count} images")
+    
+    print(f"Found {total_images} total images to process across all conditions")
+    
+    # Process all conditions
+    start_time = time.time()
+    all_results = []
+    processed_image_count = 0  # Track the actual number of images processed
+    
+    with tqdm(total=total_images, desc=f"Processing images (threshold={threshold_value})", unit="image") as pbar:
+        # Process conditions sequentially for better debugging
         for condition_dir in condition_dirs:
-            condition_image_count = 0
-            # Find batch folders
-            batch_folders = [d for d in condition_dir.iterdir() if d.is_dir() and "_output" in d.name]
-            
-            for batch_folder in batch_folders:
-                # Look specifically in the cropped_roi_with_target and full_frames_with_target subdirectories
-                cropped_roi_dir = batch_folder / "cropped_roi_with_target"
-                full_frames_dir = batch_folder / "full_frames_with_target"
-                
-                # Count images in cropped_roi_with_target
-                if cropped_roi_dir.exists():
-                    for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
-                        found_files = list(cropped_roi_dir.glob(f"*{ext}"))
-                        condition_image_count += len([f for f in found_files if 'background' not in f.name.lower()])
-                
-                # Count images in full_frames_with_target
-                if full_frames_dir.exists():
-                    for ext in ['.png', '.jpg', '.jpeg', '.tiff']:
-                        found_files = list(full_frames_dir.glob(f"*{ext}"))
-                        condition_image_count += len([f for f in found_files if 'background' not in f.name.lower()])
-            
-            total_images += condition_image_count
-            print(f"  - Condition {condition_dir.name}: {condition_image_count} images")
+            try:
+                condition_results = process_condition(
+                    pipeline=pipeline,
+                    condition_dir=condition_dir,
+                    run_output_dir=run_output_dir,
+                    run_id=run_id,
+                    background_path=None,  # Will be found in process_condition
+                    roi_coordinates=roi_coordinates,
+                    pbar=pbar
+                )
+                if condition_results:
+                    all_results.extend(condition_results)
+                    processed_image_count += len(condition_results)
+            except Exception as e:
+                logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
+                print(f"Error processing condition {condition_dir.name}: {str(e)}")
+    
+    total_runtime = time.time() - start_time
+    
+    # Count images with and without contours
+    images_with_contours = sum(1 for r in all_results if r.get('num_contours', 0) > 0)
+    images_without_contours = sum(1 for r in all_results if r.get('num_contours', 0) == 0)
+    
+    # Keep the final summary
+    print("\n" + "="*50)
+    print(f"PROCESSING SUMMARY FOR THRESHOLD {threshold_value}")
+    print("="*50)
+    print(f"Run ID: {run_id}")
+    print(f"Pipeline parameters:")
+    print(f"  - Threshold: {pipeline_params['threshold']}")
+    print(f"  - Dilate iterations: {pipeline_params['dilate_iterations']}")
+    print(f"  - Erode iterations: {pipeline_params['erode_iterations']}")
+    print(f"  - Blur kernel size: {pipeline_params['blur_kernel_size']}x{pipeline_params['blur_kernel_size']}")
+    print(f"  - Blur sigma: {pipeline_params['blur_sigma']}")
+    print(f"\nResults:")
+    print(f"  - Processed {len(all_results)} images successfully across all conditions")
+    print(f"  - Images with contours: {images_with_contours}")
+    print(f"  - Images without contours: {images_without_contours}")
+    print(f"  - Progress bar total: {total_images}")
+    print(f"  - Actually processed: {processed_image_count}")
+    
+    # If there's a discrepancy, log it
+    if total_images != processed_image_count:
+        logger.warning(f"Progress bar discrepancy: Expected to process {total_images} images but actually processed {processed_image_count}")
+    
+    # Save pipeline parameters to a JSON file
+    params_file = run_output_dir / "pipeline_parameters.json"
+    with open(params_file, 'w') as f:
+        json.dump(pipeline_params, f, indent=2)
+    
+    # Save results
+    print("\nSaving results...")
+    save_results_to_csv(all_results, run_output_dir)
+    
+    # Save ROI coordinates
+    roi_file = run_output_dir / "roi_coordinates.json"
+    with open(roi_file, 'w') as f:
+        json.dump(roi_coordinates, f, indent=2)
+    
+    print(f"\nResults saved to: {run_output_dir}")
+    print(f"Pipeline parameters saved to: {params_file}")
+    print(f"ROI coordinates saved to: {roi_file}")
+    print(f"Total runtime: {total_runtime:.2f} seconds")
+    
+    return roi_coordinates, run_output_dir
+
+def main():
+    try:
+        args = parse_args()
+        project_dir = Path(args.project_dir)
+        base_output_dir = Path(args.output_dir)
         
-        print(f"Found {total_images} total images to process across all conditions")
+        if not project_dir.exists():
+            raise FileNotFoundError(f"Project directory does not exist: {project_dir}")
         
-        # Process all conditions
-        start_time = time.time()
-        all_results = []
-        processed_image_count = 0  # Track the actual number of images processed
+        # Get condition directories
+        global condition_dirs
+        condition_dirs = [d for d in project_dir.iterdir() if d.is_dir()]
+        print(f"Found {len(condition_dirs)} condition directories")
         
-        with tqdm(total=total_images, desc="Processing images", unit="image") as pbar:
-            # Process conditions sequentially for better debugging
-            for condition_dir in condition_dirs:
-                try:
-                    condition_results = process_condition(
-                        pipeline=pipeline,
-                        condition_dir=condition_dir,
-                        run_output_dir=run_output_dir,
-                        run_id=run_id,
-                        background_path=None,  # Will be found in process_condition
-                        roi_coordinates=roi_coordinates,
-                        pbar=pbar
-                    )
-                    if condition_results:
-                        all_results.extend(condition_results)
-                        processed_image_count += len(condition_results)
-                except Exception as e:
-                    logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
-                    print(f"Error processing condition {condition_dir.name}: {str(e)}")
+        # Parse threshold values
+        threshold_values = []
+        if args.thresholds:
+            # Parse comma-separated list of thresholds
+            try:
+                threshold_values = [int(t.strip()) for t in args.thresholds.split(',')]
+                print(f"Running with multiple thresholds: {threshold_values}")
+            except ValueError:
+                print(f"Error parsing threshold values from '{args.thresholds}'. Using default threshold {args.threshold}.")
+                threshold_values = [args.threshold]
+        else:
+            # Use single threshold
+            threshold_values = [args.threshold]
+            print(f"Running with single threshold: {args.threshold}")
         
-        total_runtime = time.time() - start_time
+        # Run pipeline for each threshold value
+        roi_coordinates = None
+        all_run_dirs = []
         
-        # Count images with and without contours
-        images_with_contours = sum(1 for r in all_results if r.get('num_contours', 0) > 0)
-        images_without_contours = sum(1 for r in all_results if r.get('num_contours', 0) == 0)
+        for i, threshold in enumerate(threshold_values):
+            print(f"\nRunning threshold {i+1}/{len(threshold_values)}: {threshold}")
+            roi_coordinates, run_dir = run_pipeline_with_threshold(
+                args=args,
+                project_dir=project_dir,
+                base_output_dir=base_output_dir,
+                threshold_value=threshold,
+                roi_coordinates=roi_coordinates
+            )
+            all_run_dirs.append(run_dir)
         
-        # Keep the final summary
-        print("\n" + "="*50)
-        print("PROCESSING SUMMARY")
-        print("="*50)
-        print(f"Processed {len(all_results)} images successfully across all conditions")
-        print(f"  - Images with contours: {images_with_contours}")
-        print(f"  - Images without contours: {images_without_contours}")
-        print(f"  - Progress bar total: {total_images}")
-        print(f"  - Actually processed: {processed_image_count}")
-        
-        # If there's a discrepancy, log it
-        if total_images != processed_image_count:
-            logger.warning(f"Progress bar discrepancy: Expected to process {total_images} images but actually processed {processed_image_count}")
-        
-        # Save results
-        print("\nSaving results...")
-        save_results_to_csv(all_results, run_output_dir)
-        
-        # Save ROI coordinates
-        roi_file = run_output_dir / "roi_coordinates.json"
-        with open(roi_file, 'w') as f:
-            json.dump(roi_coordinates, f, indent=2)
-        
-        print(f"\nResults saved to: {run_output_dir}")
-        print(f"ROI coordinates saved to: {roi_file}")
-        print(f"Total runtime: {total_runtime:.2f} seconds")
+        # Print summary of all runs
+        if len(threshold_values) > 1:
+            print("\n" + "="*50)
+            print("MULTI-THRESHOLD SUMMARY")
+            print("="*50)
+            print(f"Completed {len(threshold_values)} runs with different threshold values:")
+            for i, (threshold, run_dir) in enumerate(zip(threshold_values, all_run_dirs)):
+                print(f"  {i+1}. Threshold {threshold}: {run_dir}")
+            print("\nTo compare results, check the output directories listed above.")
         
     except Exception as e:
         logger.error(f"An error occurred during pipeline execution: {str(e)}", exc_info=True)
