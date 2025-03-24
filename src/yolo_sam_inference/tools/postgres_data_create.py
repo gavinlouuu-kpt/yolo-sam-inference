@@ -12,7 +12,7 @@ The script will then create a table in the postgres database yolo_sam_inference 
 i.e., user may give minio_path = 'bead/20250226/12%_13um/' and the script will find all objects in the MinIO Tracking PostgreSQL database that match the partial path.
 i.e., 'bead/20250226/12%_13um/4/image.0997.tiff', 'bead/20250226/12%_13um/4/image.0998.tiff', 'bead/20250226/12%_13um/2/image.0998.tiff' etc.
 
-all objects in .tiff format that resides in the directory 'bead/20250226/12%_13um/' will be selected.
+All common image file formats (tiff, tif, jpg, jpeg, png, bmp, gif) that reside in the directory matching the partial path will be selected.
 '''
 
 import os
@@ -275,11 +275,20 @@ def find_matching_objects(source_conn, partial_path):
                     content_type
                 FROM minio_tracking.objects
                 WHERE minio_path LIKE '{search_path}'
-                AND minio_path LIKE '%.tiff'
+                AND (
+                    minio_path LIKE '%.tiff' OR 
+                    minio_path LIKE '%.tif' OR 
+                    minio_path LIKE '%.jpg' OR 
+                    minio_path LIKE '%.jpeg' OR 
+                    minio_path LIKE '%.png' OR 
+                    minio_path LIKE '%.bmp' OR
+                    minio_path LIKE '%.gif'
+                )
                 ORDER BY minio_path
             """
             
             logger.info(f"Executing query: {query}")
+            logger.info("Searching for all common image formats (tiff, tif, jpg, jpeg, png, bmp, gif)")
             cursor.execute(query)
             
             # Initialize an empty list for results
@@ -308,7 +317,7 @@ def find_matching_objects(source_conn, partial_path):
             
             # If we didn't find any results, try without the .tiff filter
             if not all_results:
-                logger.info("No TIFF files found. Checking if any objects match the path pattern...")
+                logger.info("No image files found. Checking if any objects match the path pattern...")
                 simple_query = f"""
                     SELECT COUNT(*) as count
                     FROM minio_tracking.objects
@@ -316,7 +325,7 @@ def find_matching_objects(source_conn, partial_path):
                 """
                 cursor.execute(simple_query)
                 count = cursor.fetchone()['count']
-                logger.info(f"Found {count} objects matching the path (including non-TIFF files)")
+                logger.info(f"Found {count} objects matching the path (including non-image files)")
                 
                 # Check a sample of what we have in the database
                 if count > 0:
@@ -329,6 +338,28 @@ def find_matching_objects(source_conn, partial_path):
                     cursor.execute(sample_query)
                     samples = cursor.fetchall()
                     logger.info(f"Sample paths: {[s['minio_path'] for s in samples]}")
+                    
+                    # Check for any image files in the database with a broader search
+                    image_query = f"""
+                        SELECT COUNT(*) as count 
+                        FROM minio_tracking.objects 
+                        WHERE minio_path LIKE '%.jpg' OR 
+                              minio_path LIKE '%.jpeg' OR 
+                              minio_path LIKE '%.png' OR 
+                              minio_path LIKE '%.tiff' OR 
+                              minio_path LIKE '%.tif' OR 
+                              minio_path LIKE '%.bmp' OR 
+                              minio_path LIKE '%.gif' 
+                        LIMIT 1
+                    """
+                    cursor.execute(image_query)
+                    image_count = cursor.fetchone()['count']
+                    logger.info(f"Database contains {image_count} image files in total (based on file extension)")
+                    
+                    if image_count > 0:
+                        logger.warning("There are image files in the database, but none match your path pattern.")
+                    else:
+                        logger.warning("No files with standard image extensions found in the database.")
             
             # Close cursor
             cursor.close()
