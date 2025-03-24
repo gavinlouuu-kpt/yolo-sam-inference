@@ -169,51 +169,16 @@ def collect_images_from_batches(condition_dir):
     # Get all batch directories
     batch_dirs = [d for d in condition_dir.iterdir() if d.is_dir() and d.name != "temp_combined_batches"]
     
-    skipped_images = []
-    copied_images = []
-    
     # Copy images from each batch with batch name prefix
     for batch_dir in batch_dirs:
         image_files = list(batch_dir.glob("*.png")) + list(batch_dir.glob("*.jpg")) + list(batch_dir.glob("*.tiff"))
         for image_file in image_files:
-            # Skip zero-byte files
-            if image_file.stat().st_size == 0:
-                skipped_images.append((str(image_file), "zero-byte file"))
-                continue
-                
-            try:
-                # Try to read the image to check if it's corrupted
-                img = cv2.imread(str(image_file))
-                if img is None:
-                    skipped_images.append((str(image_file), "corrupted or invalid image"))
-                    continue
-                    
-                # Additional validation: check if image has valid dimensions
-                if img.shape[0] == 0 or img.shape[1] == 0:
-                    skipped_images.append((str(image_file), "invalid dimensions"))
-                    continue
-                    
-                # Create new filename with batch prefix
-                new_filename = f"{batch_dir.name}_{image_file.name}"
-                new_path = temp_dir / new_filename
-                
-                # Copy the file to temp directory
-                shutil.copy2(image_file, new_path)
-                copied_images.append(str(new_path))
-                
-            except Exception as e:
-                skipped_images.append((str(image_file), f"error: {str(e)}"))
-                continue
+            # Create new filename with batch prefix
+            new_filename = f"{batch_dir.name}_{image_file.name}"
+            # Copy the file to temp directory
+            shutil.copy2(image_file, temp_dir / new_filename)
     
-    # Log summary of processed images
-    logger.info(f"Processed images for condition {condition_dir.name}:")
-    logger.info(f"- Successfully copied: {len(copied_images)} images")
-    if skipped_images:
-        logger.warning(f"- Skipped {len(skipped_images)} images:")
-        for img_path, reason in skipped_images:
-            logger.warning(f"  - {img_path}: {reason}")
-    
-    return temp_dir, copied_images, skipped_images
+    return temp_dir
 
 def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar=None):
     """Process all batches within a condition directory."""
@@ -223,23 +188,7 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
     
     try:
         # Collect and combine all images from all batches
-        temp_dir, copied_images, skipped_images = collect_images_from_batches(condition_dir)
-        
-        # Save skipped images information
-        if skipped_images:
-            skipped_file = condition_output_dir / "skipped_images.txt"
-            with open(skipped_file, 'w') as f:
-                f.write("Skipped images and reasons:\n")
-                for img_path, reason in skipped_images:
-                    f.write(f"{img_path}: {reason}\n")
-        
-        # Check if we have any valid images to process
-        if not copied_images:
-            logger.error(f"No valid images found in condition {condition_dir.name}")
-            return None
-        
-        # Debug: Print information about found images
-        logger.info(f"Found {len(copied_images)} valid images in {condition_dir.name}")
+        temp_dir = collect_images_from_batches(condition_dir)
         
         # Process all images in the temporary directory
         batch_result = pipeline.process_directory(
@@ -257,7 +206,7 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
         save_results_to_csv(batch_result, condition_output_dir)
         save_run_summary(
             batch_result,
-            temp_dir,
+            temp_dir,  # Use temp_dir as input dir for condition summary
             condition_output_dir,
             run_id,
             batch_result.total_timing['total_time'],
@@ -267,10 +216,6 @@ def process_condition(pipeline, condition_dir, run_output_dir, run_id: str, pbar
             
         return batch_result
         
-    except Exception as e:
-        logger.error(f"Error processing condition {condition_dir.name}: {str(e)}")
-        logger.error(f"Temporary directory contents: {list(temp_dir.glob('*'))}")
-        raise
     finally:
         # Clean up temporary directory
         if temp_dir.exists():
@@ -836,10 +781,7 @@ def main():
                     run_id=run_id,
                     pbar=pbar
                 )
-                if batch_result is not None:  # Only add valid results
-                    batch_results.append(batch_result)
-                else:
-                    logger.warning(f"Skipping condition {condition_dir.name} - no valid results")
+                batch_results.append(batch_result)
         
         total_runtime = time.time() - start_time
         
