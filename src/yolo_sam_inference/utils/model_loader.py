@@ -61,6 +61,18 @@ def load_model_from_registry(
     """
     logger.info(f"Loading model from MLflow Registry - Model: {model_name}, Version: {model_version or 'latest'}")
     
+    # Validate required parameters
+    if not model_name:
+        raise ValueError("Model name is required")
+    if not registry_uri:
+        raise ValueError("MLflow registry URI is required")
+    if not s3_endpoint_url:
+        raise ValueError("MinIO endpoint URL is required")
+    
+    # Format MinIO endpoint URL if needed
+    if not s3_endpoint_url.startswith(('http://', 'https://')):
+        s3_endpoint_url = f"http://{s3_endpoint_url}"
+    
     # Set up MLflow tracking URI
     logger.info(f"Using MLflow registry URI: {registry_uri}")
     mlflow.set_tracking_uri(registry_uri)
@@ -91,6 +103,7 @@ def load_model_from_registry(
         # Get the run ID for the model version
         model_details = client.get_model_version(model_name, model_version)
         run_id = model_details.run_id
+        logger.info(f"Found model version with run ID: {run_id}")
         
         # Download the model artifacts
         local_dir = client.download_artifacts(run_id, "weights/best.pt")
@@ -98,4 +111,8 @@ def load_model_from_registry(
         return local_dir
     except Exception as e:
         logger.error(f"Error downloading model artifacts from registry: {str(e)}")
+        logger.error(f"Model name: {model_name}")
+        logger.error(f"Model version: {model_version}")
+        logger.error(f"Registry URI: {registry_uri}")
+        logger.error(f"MinIO endpoint: {s3_endpoint_url}")
         raise 

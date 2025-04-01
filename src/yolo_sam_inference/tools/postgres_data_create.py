@@ -14,20 +14,22 @@ i.e., 'bead/20250226/12%_13um/4/image.0997.tiff', 'bead/20250226/12%_13um/4/imag
 
 All common image file formats (tiff, tif, jpg, jpeg, png, bmp, gif) that reside in the directory matching the partial path will be selected.
 
-Inference Results Columns:
-- mask: Array of text encodings of numpy arrays representing object segmentation masks
-- deformability: Array of deformability scores for detected objects
-- area: Array of pixel areas for each detected object
-- area_r: Array of relative area values
-- circularity: Array of circularity measures for each object
-- ch_area: Array of convex hull areas for each object
-- mean_brightness: Array of mean brightness values for each object
-- brightness_std: Array of standard deviations of brightness for each object
-- perimeter: Array of perimeter measurements for each object
-- ch_perimeter: Array of convex hull perimeter measurements for each object
+Inference Results Schema:
+- results: JSONB storing all segmentation and analysis results for an image
+  - Each result object contains:
+    - mask: Base64-encoded or RLE-encoded segmentation mask
+    - deformability: Deformability score for detected object
+    - area: Pixel area for detected object
+    - area_r: Relative area value
+    - circularity: Circularity measure for object
+    - ch_area: Convex hull area for object
+    - mean_brightness: Mean brightness value for object
+    - brightness_std: Standard deviation of brightness for object
+    - perimeter: Perimeter measurement for object
+    - ch_perimeter: Convex hull perimeter measurement for object
 
-Each of these array columns can store multiple results per image, as one image instance could 
-generate multiple detection/segmentation results.
+Using JSONB allows storing multiple detection/segmentation results per image and supports
+flexible querying of nested properties.
 '''
 
 import os
@@ -75,17 +77,8 @@ TABLE_TEMPLATES = {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         purpose VARCHAR(256),
         description TEXT,
-        processed BOOLEAN DEFAULT FALSE,
-        mask TEXT[] DEFAULT NULL,
-        deformability FLOAT[] DEFAULT NULL,
-        area FLOAT[] DEFAULT NULL,
-        area_r FLOAT[] DEFAULT NULL,
-        circularity FLOAT[] DEFAULT NULL,
-        ch_area FLOAT[] DEFAULT NULL,
-        mean_brightness FLOAT[] DEFAULT NULL,
-        brightness_std FLOAT[] DEFAULT NULL,
-        perimeter FLOAT[] DEFAULT NULL,
-        ch_perimeter FLOAT[] DEFAULT NULL,
+        empty BOOLEAN DEFAULT FALSE,
+        results JSONB DEFAULT NULL,
         UNIQUE(minio_path)
     """,
     "experiment": """
@@ -102,17 +95,8 @@ TABLE_TEMPLATES = {
         description TEXT,
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        processed BOOLEAN DEFAULT FALSE,
-        mask TEXT[] DEFAULT NULL,
-        deformability FLOAT[] DEFAULT NULL,
-        area FLOAT[] DEFAULT NULL,
-        area_r FLOAT[] DEFAULT NULL,
-        circularity FLOAT[] DEFAULT NULL,
-        ch_area FLOAT[] DEFAULT NULL,
-        mean_brightness FLOAT[] DEFAULT NULL,
-        brightness_std FLOAT[] DEFAULT NULL,
-        perimeter FLOAT[] DEFAULT NULL,
-        ch_perimeter FLOAT[] DEFAULT NULL,
+        empty BOOLEAN DEFAULT FALSE,
+        results JSONB DEFAULT NULL,
         UNIQUE(minio_path)
     """,
     "time_series": """
@@ -129,17 +113,8 @@ TABLE_TEMPLATES = {
         description TEXT,
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        processed BOOLEAN DEFAULT FALSE,
-        mask TEXT[] DEFAULT NULL,
-        deformability FLOAT[] DEFAULT NULL,
-        area FLOAT[] DEFAULT NULL,
-        area_r FLOAT[] DEFAULT NULL,
-        circularity FLOAT[] DEFAULT NULL,
-        ch_area FLOAT[] DEFAULT NULL,
-        mean_brightness FLOAT[] DEFAULT NULL,
-        brightness_std FLOAT[] DEFAULT NULL,
-        perimeter FLOAT[] DEFAULT NULL,
-        ch_perimeter FLOAT[] DEFAULT NULL,
+        empty BOOLEAN DEFAULT FALSE,
+        results JSONB DEFAULT NULL,
         UNIQUE(minio_path)
     """
 }
@@ -235,7 +210,8 @@ def create_purpose_table(conn, table_name, template_type="standard"):
             CREATE INDEX IF NOT EXISTS idx_{table_name}_minio_path ON {table_name} (minio_path);
             CREATE INDEX IF NOT EXISTS idx_{table_name}_purpose ON {table_name} (purpose);
             CREATE INDEX IF NOT EXISTS idx_{table_name}_batch_id ON {table_name} (batch_id);
-            CREATE INDEX IF NOT EXISTS idx_{table_name}_processed ON {table_name} (processed);
+            CREATE INDEX IF NOT EXISTS idx_{table_name}_empty ON {table_name} (empty);
+            CREATE INDEX IF NOT EXISTS idx_{table_name}_results ON {table_name} USING GIN (results);
         """)
         
         # Create additional indices based on template type
@@ -492,23 +468,15 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     batch_id VARCHAR(64),
                     purpose VARCHAR(256),
                     description TEXT,
-                    processed BOOLEAN,
-                    mask TEXT[],
-                    deformability FLOAT[],
-                    area FLOAT[],
-                    area_r FLOAT[],
-                    circularity FLOAT[],
-                    ch_area FLOAT[],
-                    mean_brightness FLOAT[],
-                    brightness_std FLOAT[],
-                    perimeter FLOAT[],
-                    ch_perimeter FLOAT[]
+                    empty BOOLEAN,
+                    results JSONB
                 )
             """)
             
             # Prepare data for bulk insert
             from io import StringIO
             import csv
+            import json
             
             start_time = datetime.now()
             logger.info(f"Preparing data for bulk insert, started at {start_time}")
@@ -519,6 +487,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             
             # Write data to the buffer
             for obj in objects:
+                # Create a null JSON for results
                 csv_writer.writerow([
                     obj.get('minio_path', ''),
                     obj.get('size', 0),
@@ -529,16 +498,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose,
                     description,
                     False,
-                    None,  # mask 
-                    None,  # deformability
-                    None,  # area
-                    None,  # area_r
-                    None,  # circularity
-                    None,  # ch_area
-                    None,  # mean_brightness
-                    None,  # brightness_std
-                    None,  # perimeter
-                    None   # ch_perimeter
+                    None  # results (JSON)
                 ])
             
             # Reset buffer position
@@ -552,11 +512,9 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             logger.info(f"Inserting from temporary table to target table with conflict handling")
             cursor.execute(f"""
                 INSERT INTO {table_name} 
-                (minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, processed,
-                 mask, deformability, area, area_r, circularity, ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter)
+                (minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, empty, results)
                 SELECT 
-                    minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, processed,
-                    mask, deformability, area, area_r, circularity, ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter
+                    minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -568,17 +526,8 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose = EXCLUDED.purpose,
                     description = EXCLUDED.description,
                     created_at = CURRENT_TIMESTAMP,
-                    processed = FALSE,
-                    mask = COALESCE(EXCLUDED.mask, {table_name}.mask),
-                    deformability = COALESCE(EXCLUDED.deformability, {table_name}.deformability),
-                    area = COALESCE(EXCLUDED.area, {table_name}.area),
-                    area_r = COALESCE(EXCLUDED.area_r, {table_name}.area_r),
-                    circularity = COALESCE(EXCLUDED.circularity, {table_name}.circularity),
-                    ch_area = COALESCE(EXCLUDED.ch_area, {table_name}.ch_area),
-                    mean_brightness = COALESCE(EXCLUDED.mean_brightness, {table_name}.mean_brightness),
-                    brightness_std = COALESCE(EXCLUDED.brightness_std, {table_name}.brightness_std),
-                    perimeter = COALESCE(EXCLUDED.perimeter, {table_name}.perimeter),
-                    ch_perimeter = COALESCE(EXCLUDED.ch_perimeter, {table_name}.ch_perimeter)
+                    empty = TRUE,
+                    results = COALESCE(EXCLUDED.results, {table_name}.results)
             """)
             
             # Get count of inserted records
@@ -602,17 +551,8 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose VARCHAR(256),
                     description TEXT,
                     batch_id VARCHAR(64),
-                    processed BOOLEAN,
-                    mask TEXT[],
-                    deformability FLOAT[],
-                    area FLOAT[],
-                    area_r FLOAT[],
-                    circularity FLOAT[],
-                    ch_area FLOAT[],
-                    mean_brightness FLOAT[],
-                    brightness_std FLOAT[],
-                    perimeter FLOAT[],
-                    ch_perimeter FLOAT[]
+                    empty BOOLEAN,
+                    results JSONB
                 )
             """)
             
@@ -641,16 +581,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     description,
                     batch_id,
                     False,
-                    None,  # mask 
-                    None,  # deformability
-                    None,  # area
-                    None,  # area_r
-                    None,  # circularity
-                    None,  # ch_area
-                    None,  # mean_brightness
-                    None,  # brightness_std
-                    None,  # perimeter
-                    None   # ch_perimeter
+                    None  # results (JSON)
                 ])
             
             # Reset buffer position
@@ -663,12 +594,10 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             cursor.execute(f"""
                 INSERT INTO {table_name} 
                 (minio_path, size, last_modified, etag, content_type, experiment_id, sample_type, magnification, 
-                 purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
-                 ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter)
+                 purpose, description, batch_id, empty, results)
                 SELECT 
                     minio_path, size, last_modified, etag, content_type, experiment_id, sample_type, magnification,
-                    purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
-                    ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter
+                    purpose, description, batch_id, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -683,17 +612,8 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     description = EXCLUDED.description,
                     batch_id = EXCLUDED.batch_id,
                     created_at = CURRENT_TIMESTAMP,
-                    processed = FALSE,
-                    mask = COALESCE(EXCLUDED.mask, {table_name}.mask),
-                    deformability = COALESCE(EXCLUDED.deformability, {table_name}.deformability),
-                    area = COALESCE(EXCLUDED.area, {table_name}.area),
-                    area_r = COALESCE(EXCLUDED.area_r, {table_name}.area_r),
-                    circularity = COALESCE(EXCLUDED.circularity, {table_name}.circularity),
-                    ch_area = COALESCE(EXCLUDED.ch_area, {table_name}.ch_area),
-                    mean_brightness = COALESCE(EXCLUDED.mean_brightness, {table_name}.mean_brightness),
-                    brightness_std = COALESCE(EXCLUDED.brightness_std, {table_name}.brightness_std),
-                    perimeter = COALESCE(EXCLUDED.perimeter, {table_name}.perimeter),
-                    ch_perimeter = COALESCE(EXCLUDED.ch_perimeter, {table_name}.ch_perimeter)
+                    empty = TRUE,
+                    results = COALESCE(EXCLUDED.results, {table_name}.results)
             """)
             
             # Get count of inserted records
@@ -716,17 +636,8 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose VARCHAR(256),
                     description TEXT,
                     batch_id VARCHAR(64),
-                    processed BOOLEAN,
-                    mask TEXT[],
-                    deformability FLOAT[],
-                    area FLOAT[],
-                    area_r FLOAT[],
-                    circularity FLOAT[],
-                    ch_area FLOAT[],
-                    mean_brightness FLOAT[],
-                    brightness_std FLOAT[],
-                    perimeter FLOAT[],
-                    ch_perimeter FLOAT[]
+                    empty BOOLEAN,
+                    results JSONB
                 )
             """)
             
@@ -766,16 +677,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     description,
                     batch_id,
                     False,
-                    None,  # mask 
-                    None,  # deformability
-                    None,  # area
-                    None,  # area_r
-                    None,  # circularity
-                    None,  # ch_area
-                    None,  # mean_brightness
-                    None,  # brightness_std
-                    None,  # perimeter
-                    None   # ch_perimeter
+                    None  # results (JSON)
                 ])
             
             # Reset buffer position
@@ -788,12 +690,10 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             cursor.execute(f"""
                 INSERT INTO {table_name} 
                 (minio_path, size, last_modified, etag, content_type, time_point, channel, sequence_id,
-                 purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
-                 ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter)
+                 purpose, description, batch_id, empty, results)
                 SELECT 
                     minio_path, size, last_modified, etag, content_type, time_point, channel, sequence_id,
-                    purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
-                    ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter
+                    purpose, description, batch_id, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -808,17 +708,8 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     description = EXCLUDED.description,
                     batch_id = EXCLUDED.batch_id,
                     created_at = CURRENT_TIMESTAMP,
-                    processed = FALSE,
-                    mask = COALESCE(EXCLUDED.mask, {table_name}.mask),
-                    deformability = COALESCE(EXCLUDED.deformability, {table_name}.deformability),
-                    area = COALESCE(EXCLUDED.area, {table_name}.area),
-                    area_r = COALESCE(EXCLUDED.area_r, {table_name}.area_r),
-                    circularity = COALESCE(EXCLUDED.circularity, {table_name}.circularity),
-                    ch_area = COALESCE(EXCLUDED.ch_area, {table_name}.ch_area),
-                    mean_brightness = COALESCE(EXCLUDED.mean_brightness, {table_name}.mean_brightness),
-                    brightness_std = COALESCE(EXCLUDED.brightness_std, {table_name}.brightness_std),
-                    perimeter = COALESCE(EXCLUDED.perimeter, {table_name}.perimeter),
-                    ch_perimeter = COALESCE(EXCLUDED.ch_perimeter, {table_name}.ch_perimeter)
+                    empty = TRUE,
+                    results = COALESCE(EXCLUDED.results, {table_name}.results)
             """)
             
             # Get count of inserted records
@@ -883,45 +774,70 @@ def get_table_summary(target_conn, table_name):
         """)
         purpose_counts = cursor.fetchall()
         
-        # Get processed status
+        # Get empty status
         cursor.execute(f"""
-            SELECT processed, COUNT(*) as count
+            SELECT empty, COUNT(*) as count
             FROM {table_name}
-            GROUP BY processed
-            ORDER BY processed
+            GROUP BY empty
+            ORDER BY empty
         """)
-        processed_counts = cursor.fetchall()
+        empty_counts = cursor.fetchall()
         
         # Get inference result statistics
-        inference_counts = {}
+        # Check if the results column exists
+        cursor.execute(f"""
+            SELECT EXISTS (
+               SELECT 1 
+               FROM information_schema.columns 
+               WHERE table_name = '{table_name}' 
+               AND column_name = 'results'
+            ) as exists_flag
+        """)
+        results_exists = cursor.fetchone()['exists_flag']
         
-        # Check if column exists before querying
-        for column in ['mask', 'deformability', 'area', 'area_r', 'circularity', 
-                       'ch_area', 'mean_brightness', 'brightness_std', 'perimeter', 'ch_perimeter']:
+        inference_stats = {}
+        if results_exists:
+            # Count records with results data
             cursor.execute(f"""
-                SELECT EXISTS (
-                   SELECT 1 
-                   FROM information_schema.columns 
-                   WHERE table_name = '{table_name}' 
-                   AND column_name = '{column}'
-                ) as exists_flag
+                SELECT 
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE results IS NOT NULL) as with_results,
+                    COUNT(*) FILTER (WHERE results IS NULL) as without_results,
+                    COUNT(*) FILTER (WHERE jsonb_array_length(results) > 0) as with_objects
+                FROM {table_name}
             """)
-            column_exists = cursor.fetchone()['exists_flag']
+            result_stats = cursor.fetchone()
             
-            if column_exists:
-                cursor.execute(f"""
-                    SELECT 
-                        COUNT(*) as total,
-                        COUNT(*) FILTER (WHERE {column} IS NOT NULL) as with_data,
-                        COUNT(*) FILTER (WHERE {column} IS NULL) as without_data
-                    FROM {table_name}
-                """)
-                column_stats = cursor.fetchone()
-                inference_counts[column] = {
-                    'with_data': column_stats['with_data'],
-                    'without_data': column_stats['without_data'],
-                    'percent_complete': (column_stats['with_data'] / column_stats['total'] * 100) if column_stats['total'] > 0 else 0
-                }
+            # Get more detailed stats about result properties
+            cursor.execute(f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(results) 
+                        WHERE jsonb_typeof(jsonb_array_elements.value->'mask') IS NOT NULL
+                    )) as with_masks,
+                    COUNT(*) FILTER (WHERE EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(results) 
+                        WHERE jsonb_typeof(jsonb_array_elements.value->'deformability') IS NOT NULL
+                    )) as with_deformability,
+                    COUNT(*) FILTER (WHERE EXISTS (
+                        SELECT 1 FROM jsonb_array_elements(results) 
+                        WHERE jsonb_typeof(jsonb_array_elements.value->'area') IS NOT NULL
+                    )) as with_area
+                FROM {table_name}
+                WHERE results IS NOT NULL
+            """)
+            property_stats = cursor.fetchone()
+            
+            inference_stats = {
+                'total_images': result_stats['total'],
+                'with_results': result_stats['with_results'],
+                'without_results': result_stats['without_results'],
+                'with_detected_objects': result_stats['with_objects'],
+                'with_masks': property_stats['with_masks'],
+                'with_deformability': property_stats['with_deformability'],
+                'with_area': property_stats['with_area'],
+                'percent_complete': (result_stats['with_results'] / result_stats['total'] * 100) if result_stats['total'] > 0 else 0
+            }
         
         cursor.close()
         
@@ -929,8 +845,8 @@ def get_table_summary(target_conn, table_name):
             'table_name': table_name,
             'total_count': total_count,
             'purpose_counts': purpose_counts,
-            'processed_counts': processed_counts,
-            'inference_counts': inference_counts
+            'empty_counts': empty_counts,
+            'inference_stats': inference_stats
         }
     except Exception as e:
         logger.error(f"Error getting table summary: {e}")
@@ -1024,16 +940,18 @@ def main():
                 print(f"    {pc['purpose']}: {pc['count']} objects")
             
             print("\n  Processing status:")
-            for pc in summary['processed_counts']:
-                status = "Processed" if pc['processed'] else "Not processed"
+            for pc in summary['empty_counts']:
+                status = "empty" if pc['empty'] else "Not empty"
                 print(f"    {status}: {pc['count']} objects")
             
-            print("\n  Inference result statistics:")
-            for column, stats in summary['inference_counts'].items():
-                print(f"    {column}:")
-                print(f"      With data: {stats['with_data']}")
-                print(f"      Without data: {stats['without_data']}")
-                print(f"      Percent complete: {stats['percent_complete']:.2f}%")
+            if 'inference_stats' in summary and summary['inference_stats']:
+                print("\n  Inference result statistics:")
+                stats = summary['inference_stats']
+                print(f"    Images with results: {stats['with_results']} of {stats['total_images']} ({stats['percent_complete']:.2f}%)")
+                print(f"    Images with detected objects: {stats['with_detected_objects']}")
+                print(f"    Images with masks: {stats['with_masks']}")
+                print(f"    Images with deformability measurements: {stats['with_deformability']}")
+                print(f"    Images with area measurements: {stats['with_area']}")
             print()
         
         # Close target connection
