@@ -13,6 +13,21 @@ i.e., user may give minio_path = 'bead/20250226/12%_13um/' and the script will f
 i.e., 'bead/20250226/12%_13um/4/image.0997.tiff', 'bead/20250226/12%_13um/4/image.0998.tiff', 'bead/20250226/12%_13um/2/image.0998.tiff' etc.
 
 All common image file formats (tiff, tif, jpg, jpeg, png, bmp, gif) that reside in the directory matching the partial path will be selected.
+
+Inference Results Columns:
+- mask: Array of text encodings of numpy arrays representing object segmentation masks
+- deformability: Array of deformability scores for detected objects
+- area: Array of pixel areas for each detected object
+- area_r: Array of relative area values
+- circularity: Array of circularity measures for each object
+- ch_area: Array of convex hull areas for each object
+- mean_brightness: Array of mean brightness values for each object
+- brightness_std: Array of standard deviations of brightness for each object
+- perimeter: Array of perimeter measurements for each object
+- ch_perimeter: Array of convex hull perimeter measurements for each object
+
+Each of these array columns can store multiple results per image, as one image instance could 
+generate multiple detection/segmentation results.
 '''
 
 import os
@@ -61,6 +76,16 @@ TABLE_TEMPLATES = {
         purpose VARCHAR(256),
         description TEXT,
         processed BOOLEAN DEFAULT FALSE,
+        mask TEXT[] DEFAULT NULL,
+        deformability FLOAT[] DEFAULT NULL,
+        area FLOAT[] DEFAULT NULL,
+        area_r FLOAT[] DEFAULT NULL,
+        circularity FLOAT[] DEFAULT NULL,
+        ch_area FLOAT[] DEFAULT NULL,
+        mean_brightness FLOAT[] DEFAULT NULL,
+        brightness_std FLOAT[] DEFAULT NULL,
+        perimeter FLOAT[] DEFAULT NULL,
+        ch_perimeter FLOAT[] DEFAULT NULL,
         UNIQUE(minio_path)
     """,
     "experiment": """
@@ -78,6 +103,16 @@ TABLE_TEMPLATES = {
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         processed BOOLEAN DEFAULT FALSE,
+        mask TEXT[] DEFAULT NULL,
+        deformability FLOAT[] DEFAULT NULL,
+        area FLOAT[] DEFAULT NULL,
+        area_r FLOAT[] DEFAULT NULL,
+        circularity FLOAT[] DEFAULT NULL,
+        ch_area FLOAT[] DEFAULT NULL,
+        mean_brightness FLOAT[] DEFAULT NULL,
+        brightness_std FLOAT[] DEFAULT NULL,
+        perimeter FLOAT[] DEFAULT NULL,
+        ch_perimeter FLOAT[] DEFAULT NULL,
         UNIQUE(minio_path)
     """,
     "time_series": """
@@ -95,6 +130,16 @@ TABLE_TEMPLATES = {
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         processed BOOLEAN DEFAULT FALSE,
+        mask TEXT[] DEFAULT NULL,
+        deformability FLOAT[] DEFAULT NULL,
+        area FLOAT[] DEFAULT NULL,
+        area_r FLOAT[] DEFAULT NULL,
+        circularity FLOAT[] DEFAULT NULL,
+        ch_area FLOAT[] DEFAULT NULL,
+        mean_brightness FLOAT[] DEFAULT NULL,
+        brightness_std FLOAT[] DEFAULT NULL,
+        perimeter FLOAT[] DEFAULT NULL,
+        ch_perimeter FLOAT[] DEFAULT NULL,
         UNIQUE(minio_path)
     """
 }
@@ -447,7 +492,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     batch_id VARCHAR(64),
                     purpose VARCHAR(256),
                     description TEXT,
-                    processed BOOLEAN
+                    processed BOOLEAN,
+                    mask TEXT[],
+                    deformability FLOAT[],
+                    area FLOAT[],
+                    area_r FLOAT[],
+                    circularity FLOAT[],
+                    ch_area FLOAT[],
+                    mean_brightness FLOAT[],
+                    brightness_std FLOAT[],
+                    perimeter FLOAT[],
+                    ch_perimeter FLOAT[]
                 )
             """)
             
@@ -473,7 +528,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     batch_id,
                     purpose,
                     description,
-                    False
+                    False,
+                    None,  # mask 
+                    None,  # deformability
+                    None,  # area
+                    None,  # area_r
+                    None,  # circularity
+                    None,  # ch_area
+                    None,  # mean_brightness
+                    None,  # brightness_std
+                    None,  # perimeter
+                    None   # ch_perimeter
                 ])
             
             # Reset buffer position
@@ -487,9 +552,11 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             logger.info(f"Inserting from temporary table to target table with conflict handling")
             cursor.execute(f"""
                 INSERT INTO {table_name} 
-                (minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, processed)
+                (minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, processed,
+                 mask, deformability, area, area_r, circularity, ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter)
                 SELECT 
-                    minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, processed
+                    minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, processed,
+                    mask, deformability, area, area_r, circularity, ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -501,7 +568,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose = EXCLUDED.purpose,
                     description = EXCLUDED.description,
                     created_at = CURRENT_TIMESTAMP,
-                    processed = FALSE
+                    processed = FALSE,
+                    mask = COALESCE(EXCLUDED.mask, {table_name}.mask),
+                    deformability = COALESCE(EXCLUDED.deformability, {table_name}.deformability),
+                    area = COALESCE(EXCLUDED.area, {table_name}.area),
+                    area_r = COALESCE(EXCLUDED.area_r, {table_name}.area_r),
+                    circularity = COALESCE(EXCLUDED.circularity, {table_name}.circularity),
+                    ch_area = COALESCE(EXCLUDED.ch_area, {table_name}.ch_area),
+                    mean_brightness = COALESCE(EXCLUDED.mean_brightness, {table_name}.mean_brightness),
+                    brightness_std = COALESCE(EXCLUDED.brightness_std, {table_name}.brightness_std),
+                    perimeter = COALESCE(EXCLUDED.perimeter, {table_name}.perimeter),
+                    ch_perimeter = COALESCE(EXCLUDED.ch_perimeter, {table_name}.ch_perimeter)
             """)
             
             # Get count of inserted records
@@ -525,7 +602,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose VARCHAR(256),
                     description TEXT,
                     batch_id VARCHAR(64),
-                    processed BOOLEAN
+                    processed BOOLEAN,
+                    mask TEXT[],
+                    deformability FLOAT[],
+                    area FLOAT[],
+                    area_r FLOAT[],
+                    circularity FLOAT[],
+                    ch_area FLOAT[],
+                    mean_brightness FLOAT[],
+                    brightness_std FLOAT[],
+                    perimeter FLOAT[],
+                    ch_perimeter FLOAT[]
                 )
             """)
             
@@ -553,7 +640,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose,
                     description,
                     batch_id,
-                    False
+                    False,
+                    None,  # mask 
+                    None,  # deformability
+                    None,  # area
+                    None,  # area_r
+                    None,  # circularity
+                    None,  # ch_area
+                    None,  # mean_brightness
+                    None,  # brightness_std
+                    None,  # perimeter
+                    None   # ch_perimeter
                 ])
             
             # Reset buffer position
@@ -566,10 +663,12 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             cursor.execute(f"""
                 INSERT INTO {table_name} 
                 (minio_path, size, last_modified, etag, content_type, experiment_id, sample_type, magnification, 
-                 purpose, description, batch_id, processed)
+                 purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
+                 ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter)
                 SELECT 
                     minio_path, size, last_modified, etag, content_type, experiment_id, sample_type, magnification,
-                    purpose, description, batch_id, processed
+                    purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
+                    ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -584,7 +683,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     description = EXCLUDED.description,
                     batch_id = EXCLUDED.batch_id,
                     created_at = CURRENT_TIMESTAMP,
-                    processed = FALSE
+                    processed = FALSE,
+                    mask = COALESCE(EXCLUDED.mask, {table_name}.mask),
+                    deformability = COALESCE(EXCLUDED.deformability, {table_name}.deformability),
+                    area = COALESCE(EXCLUDED.area, {table_name}.area),
+                    area_r = COALESCE(EXCLUDED.area_r, {table_name}.area_r),
+                    circularity = COALESCE(EXCLUDED.circularity, {table_name}.circularity),
+                    ch_area = COALESCE(EXCLUDED.ch_area, {table_name}.ch_area),
+                    mean_brightness = COALESCE(EXCLUDED.mean_brightness, {table_name}.mean_brightness),
+                    brightness_std = COALESCE(EXCLUDED.brightness_std, {table_name}.brightness_std),
+                    perimeter = COALESCE(EXCLUDED.perimeter, {table_name}.perimeter),
+                    ch_perimeter = COALESCE(EXCLUDED.ch_perimeter, {table_name}.ch_perimeter)
             """)
             
             # Get count of inserted records
@@ -607,7 +716,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose VARCHAR(256),
                     description TEXT,
                     batch_id VARCHAR(64),
-                    processed BOOLEAN
+                    processed BOOLEAN,
+                    mask TEXT[],
+                    deformability FLOAT[],
+                    area FLOAT[],
+                    area_r FLOAT[],
+                    circularity FLOAT[],
+                    ch_area FLOAT[],
+                    mean_brightness FLOAT[],
+                    brightness_std FLOAT[],
+                    perimeter FLOAT[],
+                    ch_perimeter FLOAT[]
                 )
             """)
             
@@ -646,7 +765,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     purpose,
                     description,
                     batch_id,
-                    False
+                    False,
+                    None,  # mask 
+                    None,  # deformability
+                    None,  # area
+                    None,  # area_r
+                    None,  # circularity
+                    None,  # ch_area
+                    None,  # mean_brightness
+                    None,  # brightness_std
+                    None,  # perimeter
+                    None   # ch_perimeter
                 ])
             
             # Reset buffer position
@@ -659,10 +788,12 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             cursor.execute(f"""
                 INSERT INTO {table_name} 
                 (minio_path, size, last_modified, etag, content_type, time_point, channel, sequence_id,
-                 purpose, description, batch_id, processed)
+                 purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
+                 ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter)
                 SELECT 
                     minio_path, size, last_modified, etag, content_type, time_point, channel, sequence_id,
-                    purpose, description, batch_id, processed
+                    purpose, description, batch_id, processed, mask, deformability, area, area_r, circularity, 
+                    ch_area, mean_brightness, brightness_std, perimeter, ch_perimeter
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -677,7 +808,17 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     description = EXCLUDED.description,
                     batch_id = EXCLUDED.batch_id,
                     created_at = CURRENT_TIMESTAMP,
-                    processed = FALSE
+                    processed = FALSE,
+                    mask = COALESCE(EXCLUDED.mask, {table_name}.mask),
+                    deformability = COALESCE(EXCLUDED.deformability, {table_name}.deformability),
+                    area = COALESCE(EXCLUDED.area, {table_name}.area),
+                    area_r = COALESCE(EXCLUDED.area_r, {table_name}.area_r),
+                    circularity = COALESCE(EXCLUDED.circularity, {table_name}.circularity),
+                    ch_area = COALESCE(EXCLUDED.ch_area, {table_name}.ch_area),
+                    mean_brightness = COALESCE(EXCLUDED.mean_brightness, {table_name}.mean_brightness),
+                    brightness_std = COALESCE(EXCLUDED.brightness_std, {table_name}.brightness_std),
+                    perimeter = COALESCE(EXCLUDED.perimeter, {table_name}.perimeter),
+                    ch_perimeter = COALESCE(EXCLUDED.ch_perimeter, {table_name}.ch_perimeter)
             """)
             
             # Get count of inserted records
@@ -751,13 +892,45 @@ def get_table_summary(target_conn, table_name):
         """)
         processed_counts = cursor.fetchall()
         
+        # Get inference result statistics
+        inference_counts = {}
+        
+        # Check if column exists before querying
+        for column in ['mask', 'deformability', 'area', 'area_r', 'circularity', 
+                       'ch_area', 'mean_brightness', 'brightness_std', 'perimeter', 'ch_perimeter']:
+            cursor.execute(f"""
+                SELECT EXISTS (
+                   SELECT 1 
+                   FROM information_schema.columns 
+                   WHERE table_name = '{table_name}' 
+                   AND column_name = '{column}'
+                ) as exists_flag
+            """)
+            column_exists = cursor.fetchone()['exists_flag']
+            
+            if column_exists:
+                cursor.execute(f"""
+                    SELECT 
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE {column} IS NOT NULL) as with_data,
+                        COUNT(*) FILTER (WHERE {column} IS NULL) as without_data
+                    FROM {table_name}
+                """)
+                column_stats = cursor.fetchone()
+                inference_counts[column] = {
+                    'with_data': column_stats['with_data'],
+                    'without_data': column_stats['without_data'],
+                    'percent_complete': (column_stats['with_data'] / column_stats['total'] * 100) if column_stats['total'] > 0 else 0
+                }
+        
         cursor.close()
         
         return {
             'table_name': table_name,
             'total_count': total_count,
             'purpose_counts': purpose_counts,
-            'processed_counts': processed_counts
+            'processed_counts': processed_counts,
+            'inference_counts': inference_counts
         }
     except Exception as e:
         logger.error(f"Error getting table summary: {e}")
@@ -854,6 +1027,13 @@ def main():
             for pc in summary['processed_counts']:
                 status = "Processed" if pc['processed'] else "Not processed"
                 print(f"    {status}: {pc['count']} objects")
+            
+            print("\n  Inference result statistics:")
+            for column, stats in summary['inference_counts'].items():
+                print(f"    {column}:")
+                print(f"      With data: {stats['with_data']}")
+                print(f"      Without data: {stats['without_data']}")
+                print(f"      Percent complete: {stats['percent_complete']:.2f}%")
             print()
         
         # Close target connection

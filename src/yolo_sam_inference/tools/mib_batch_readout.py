@@ -85,6 +85,7 @@ from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 import sys
 import io
+import argparse
 
 def get_batch_data(project_path: str) -> pd.DataFrame:
     client = Minio(
@@ -163,8 +164,11 @@ def get_batch_data(project_path: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 if __name__ == "__main__":
-    project_path = "Qinru/2025_cells/ms_20250326_231_ALL_10ul_1"
-    df = get_batch_data(project_path)
+    parser = argparse.ArgumentParser(description='Process batch data from MinIO storage')
+    parser.add_argument('project_path', type=str, help='Path to the project in MinIO bucket (e.g., Qinru/2025_cells/ms_20250326_231_ALL_10ul_1)')
+    args = parser.parse_args()
+
+    df = get_batch_data(args.project_path)
     print(df.head(100))
     if not df.empty:
         print(f"\nSUCCESS: Final DataFrame has {len(df)} rows", file=sys.stderr)
