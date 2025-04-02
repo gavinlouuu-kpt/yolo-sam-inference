@@ -77,8 +77,9 @@ TABLE_TEMPLATES = {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         purpose VARCHAR(256),
         description TEXT,
-        empty BOOLEAN DEFAULT FALSE,
+        empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
+        error TEXT,
         UNIQUE(minio_path)
     """,
     "experiment": """
@@ -95,8 +96,9 @@ TABLE_TEMPLATES = {
         description TEXT,
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        empty BOOLEAN DEFAULT FALSE,
+        empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
+        error TEXT,
         UNIQUE(minio_path)
     """,
     "time_series": """
@@ -113,8 +115,9 @@ TABLE_TEMPLATES = {
         description TEXT,
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        empty BOOLEAN DEFAULT FALSE,
+        empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
+        error TEXT,
         UNIQUE(minio_path)
     """
 }
