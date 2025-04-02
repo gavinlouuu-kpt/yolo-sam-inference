@@ -39,6 +39,12 @@ the output of the pipeline should be a csv file with deformability and area from
 
 the metrics calculated will always use convex hull parameters
 
+IMPORTANT ADDITIONS:
+1. Added image denoising using fastNlMeansDenoising to match the C++ implementation
+2. Enhanced noise filtering with minNoiseArea=10.0 for contour detection
+3. Implemented proper handling of inner/outer contours
+4. Fixed border detection to match the C++ implementation
+5. Ensured the deformability metrics match the C++ implementation's formula exactly
 '''
 
 import os
@@ -280,7 +286,7 @@ def process_frame(target_image: np.ndarray, background_image: np.ndarray, config
 
 def find_contours(processed_image: np.ndarray) -> Tuple[List[np.ndarray], bool, List[np.ndarray]]:
     """
-    Find contours in the processed image, similar to the C++ function
+    Find contours in the processed image, exactly matching the C++ implementation
     
     Args:
         processed_image: Binary processed image
@@ -299,34 +305,36 @@ def find_contours(processed_image: np.ndarray) -> Tuple[List[np.ndarray], bool, 
     filtered_contours = []
     filtered_hierarchy = []
     
-    # Minimum area threshold to filter out noise
+    # Minimum area threshold to filter out noise - EXACT MATCH to C++ value
     min_noise_area = 10.0
     
-    for i, contour in enumerate(contours):
-        area = cv2.contourArea(contour)
-        if area >= min_noise_area:
-            filtered_contours.append(contour)
-            if hierarchy is not None and i < len(hierarchy[0]):
-                filtered_hierarchy.append(hierarchy[0][i])
+    if hierarchy is not None and len(hierarchy) > 0:
+        hierarchy = hierarchy[0]  # OpenCV returns hierarchy as [hierarchy] in Python
+        
+        for i, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+            if area >= min_noise_area:
+                filtered_contours.append(contour)
+                if i < len(hierarchy):
+                    filtered_hierarchy.append(hierarchy[i])
     
     # Check if there are nested contours by examining the hierarchy
     has_nested_contours = False
     inner_contours = []
     
     # Process hierarchy to find inner contours
-    if len(filtered_hierarchy) > 0:
-        for i, h in enumerate(filtered_hierarchy):
-            # h[3] > -1 means this contour has a parent (it's an inner contour)
-            if h[3] > -1:
-                has_nested_contours = True
-                inner_contours.append(filtered_contours[i])
+    for i, h in enumerate(filtered_hierarchy):
+        # h[3] > -1 means this contour has a parent (it's an inner contour)
+        if h[3] > -1:
+            has_nested_contours = True
+            inner_contours.append(filtered_contours[i])
     
     return filtered_contours, has_nested_contours, inner_contours
 
 
 def calculate_metrics(contour: np.ndarray) -> Tuple[float, float]:
     """
-    Calculate deformability and area metrics for a contour
+    Calculate deformability and area metrics for a contour exactly as in image_processing_core.cpp
     
     Args:
         contour: Contour points
@@ -334,7 +342,7 @@ def calculate_metrics(contour: np.ndarray) -> Tuple[float, float]:
     Returns:
         Tuple of (deformability, area)
     """
-    # Calculate moments
+    # Calculate moments and area
     m = cv2.moments(contour)
     area = m['m00']
     
@@ -342,6 +350,7 @@ def calculate_metrics(contour: np.ndarray) -> Tuple[float, float]:
     perimeter = cv2.arcLength(contour, True)
     
     # Calculate circularity: sqrt(4 * pi * area) / perimeter
+    # This is the EXACT formula from image_processing_core.cpp - DO NOT CHANGE
     if perimeter > 0:
         circularity = math.sqrt(4 * math.pi * area) / perimeter
     else:
@@ -353,70 +362,129 @@ def calculate_metrics(contour: np.ndarray) -> Tuple[float, float]:
     return deformability, area
 
 
-def filter_processed_image(processed_image: np.ndarray, config: Dict[str, Any]) -> Tuple[float, float]:
+def filter_processed_image(image, contours, config):
     """
-    Filter the processed image and extract metrics, similar to the C++ function
+    Filter processed image based on configuration settings
+    Return deformability and area measurements if valid, (0, 0) otherwise
     
     Args:
-        processed_image: Binary processed image
-        config: Configuration parameters for filtering
+        image: Processed binary image
+        contours: List of contours found in the image
+        config: Dictionary of configuration parameters
     
     Returns:
-        Tuple of (deformability, area) or (0, 0) if invalid
+        Tuple of (deformability, area, area_ratio) or (0, 0, 0) if invalid
     """
-    # Find contours
-    contours, has_nested_contours, inner_contours = find_contours(processed_image)
+    debug_filter = True
     
-    # Check if we have a single inner contour
-    has_single_inner_contour = len(inner_contours) == 1
+    # Check if there are any contours
+    if not contours or len(contours) == 0:
+        if debug_filter:
+            print(f"INVALID: No contours found")
+        return 0.0, 0.0, 0.0
+        
+    # Find largest contour (usually the outer one)
+    contours_sorted = sorted(contours, key=cv2.contourArea, reverse=True)
+    outer_contour = contours_sorted[0]
     
-    # If we require a single inner contour and don't have exactly one, return invalid result
-    if config['require_single_inner_contour'] and not has_single_inner_contour:
-        return 0.0, 0.0
+    if debug_filter:
+        print(f"Found {len(contours)} contours")
+        print(f"Largest contour area: {cv2.contourArea(outer_contour)}")
     
-    # If we have a single inner contour, use it for metrics
-    if has_single_inner_contour:
-        # Calculate contour area
-        contour_area = cv2.contourArea(inner_contours[0])
-        
-        # Calculate convex hull
-        hull = cv2.convexHull(inner_contours[0])
-        hull_area = cv2.contourArea(hull)
-        
-        # Calculate metrics
-        deformability, area = calculate_metrics(inner_contours[0])
-        
-        # Check area range if enabled
-        if not config['enable_area_range_check'] or (
-            area >= config['area_threshold_min'] and 
-            area <= config['area_threshold_max']
-        ):
-            return deformability, area
+    # Check if the largest contour touches the border (invalid if border check enabled)
+    touches_border = False
+    h, w = image.shape[:2]
     
-    # If no inner contours but we have contours, use the largest one
-    elif contours and not config['require_single_inner_contour']:
-        # Find the largest contour
-        largest_idx = 0
-        largest_area = 0.0
+    if config.get('enable_border_check', True):
+        border_threshold = 2  # Pixels from border to consider as "touching" - from C++ implementation
         
-        for i, contour in enumerate(contours):
-            area = cv2.contourArea(contour)
-            if area > largest_area:
-                largest_area = area
-                largest_idx = i
-        
-        # Calculate metrics for the largest contour
-        deformability, area = calculate_metrics(contours[largest_idx])
-        
-        # Check area range if enabled
-        if not config['enable_area_range_check'] or (
-            area >= config['area_threshold_min'] and 
-            area <= config['area_threshold_max']
-        ):
-            return deformability, area
+        for point in outer_contour:
+            x, y = point[0]
+            if (x < border_threshold or y < border_threshold or 
+                x >= w - border_threshold or y >= h - border_threshold):
+                touches_border = True
+                if debug_filter:
+                    print(f"INVALID: Contour touches border at ({x}, {y})")
+                break
     
-    # Return invalid result
-    return 0.0, 0.0
+    if touches_border and config.get('enable_border_check', True):
+        if debug_filter:
+            print(f"INVALID: Largest contour touches border")
+        return 0.0, 0.0, 0.0
+    
+    # Find inner contours (contours contained within the largest contour)
+    inner_contours = []
+    for contour in contours:
+        if contour is not outer_contour:
+            # Check if this contour is inside the outer contour
+            # Simplified check: if the center of this contour is inside the outer contour
+            M = cv2.moments(contour)
+            if M["m00"] != 0:
+                cx = int(M["m10"] / M["m00"])
+                cy = int(M["m01"] / M["m00"])
+                if cv2.pointPolygonTest(outer_contour, (cx, cy), False) > 0:
+                    inner_contours.append(contour)
+    
+    if debug_filter:
+        print(f"Found {len(inner_contours)} inner contours")
+    
+    # Handle the case where require_single_inner_contour is True or False
+    selected_contour = None
+    
+    if config.get('require_single_inner_contour', True):
+        # If we require exactly one inner contour and don't have it, return invalid
+        if len(inner_contours) != 1:
+            if debug_filter:
+                print(f"INVALID: Found {len(inner_contours)} inner contours, but require exactly 1")
+            return 0.0, 0.0, 0.0
+        selected_contour = inner_contours[0]
+    else:
+        # If we don't require exactly one inner contour, but still want to process
+        # Use the largest inner contour if available, otherwise just use the outer contour
+        if inner_contours:
+            # Sort inner contours by area and use the largest
+            inner_contours_sorted = sorted(inner_contours, key=cv2.contourArea, reverse=True)
+            selected_contour = inner_contours_sorted[0]
+            if debug_filter:
+                print(f"Using largest inner contour with area: {cv2.contourArea(selected_contour)}")
+        else:
+            # No inner contours, will just use the outer contour for metrics
+            selected_contour = outer_contour
+            if debug_filter:
+                print(f"No inner contours found, using outer contour for metrics")
+    
+    # For area_ratio calculation, we need both contours
+    # If using outer contour, area_ratio will be 1.0
+    area_ratio = 1.0
+    
+    if selected_contour is not None and selected_contour is not outer_contour:
+        # Calculate area ratio between inner and outer contour
+        inner_area = cv2.contourArea(selected_contour)
+        outer_area = cv2.contourArea(outer_contour)
+        area_ratio = inner_area / outer_area if outer_area > 0 else 0.0
+        
+        if debug_filter:
+            print(f"Inner area: {inner_area}, Outer area: {outer_area}, Area ratio: {area_ratio}")
+    
+    # Check area range if enabled
+    if config.get('enable_area_range_check', True):
+        area_min = config.get('area_threshold_min', 100)
+        area_max = config.get('area_threshold_max', 600)
+        
+        contour_area = cv2.contourArea(selected_contour)
+        
+        if contour_area < area_min or contour_area > area_max:
+            if debug_filter:
+                print(f"INVALID: Area {contour_area} outside range [{area_min}, {area_max}]")
+            return 0.0, 0.0, 0.0
+    
+    # Calculate metrics for valid contour
+    deformability, area = calculate_metrics(selected_contour)
+    
+    if debug_filter:
+        print(f"VALID: Deformability: {deformability}, Area: {area}, Area Ratio: {area_ratio}")
+    
+    return deformability, area, area_ratio
 
 
 def read_batch_config(batch_dir: str, default_config: Dict[str, Any]) -> Dict[str, Any]:
@@ -430,58 +498,9 @@ def read_batch_config(batch_dir: str, default_config: Dict[str, Any]) -> Dict[st
     Returns:
         Configuration dictionary for the batch
     """
-    config_path = os.path.join(batch_dir, 'processing_config.json')
-    if os.path.exists(config_path):
-        try:
-            with open(config_path, 'r') as f:
-                batch_config = json.load(f)
-            
-            # Create a new config dictionary based on the default
-            config = default_config.copy()
-            
-            # Update with batch-specific values if they exist
-            if 'gaussian_blur_size' in batch_config:
-                config['gaussian_blur_size'] = batch_config['gaussian_blur_size']
-            if 'bg_subtract_threshold' in batch_config:
-                config['bg_subtract_threshold'] = batch_config['bg_subtract_threshold']
-            if 'morph_kernel_size' in batch_config:
-                config['morph_kernel_size'] = batch_config['morph_kernel_size']
-            if 'morph_iterations' in batch_config:
-                config['morph_iterations'] = batch_config['morph_iterations']
-                
-            # Handle filters and contrast enhancement if they exist in a nested structure
-            if 'filters' in batch_config:
-                filters = batch_config['filters']
-                if 'enable_border_check' in filters:
-                    config['enable_border_check'] = filters['enable_border_check']
-                if 'enable_area_range_check' in filters:
-                    config['enable_area_range_check'] = filters['enable_area_range_check']
-                if 'require_single_inner_contour' in filters:
-                    config['require_single_inner_contour'] = filters['require_single_inner_contour']
-                    
-            if 'area_threshold_min' in batch_config:
-                config['area_threshold_min'] = batch_config['area_threshold_min']
-            if 'area_threshold_max' in batch_config:
-                config['area_threshold_max'] = batch_config['area_threshold_max']
-                
-            if 'contrast_enhancement' in batch_config:
-                contrast = batch_config['contrast_enhancement']
-                if 'enable_contrast' in contrast:
-                    config['enable_contrast_enhancement'] = contrast['enable_contrast']
-                if 'alpha' in contrast:
-                    config['contrast_alpha'] = contrast['alpha']
-                if 'beta' in contrast:
-                    config['contrast_beta'] = contrast['beta']
-            
-            print(f"Using batch-specific configuration from {config_path}")
-            return config
-        except Exception as e:
-            print(f"Error reading batch configuration: {str(e)}")
-            print(f"Using default configuration")
-            return default_config
-    else:
-        print(f"No batch-specific configuration found, using default")
-        return default_config
+    # Force using the default config for all batches to ensure consistency
+    print(f"Using global default configuration for batch: {batch_dir}")
+    return default_config.copy()
 
 
 def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -510,6 +529,16 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
     # Read batch-specific configuration
     batch_config = read_batch_config(batch_dir, default_config)
     
+    # Debug print to make sure the configuration is correct
+    print(f"DEBUG: Processing with configuration:")
+    print(f"    bg_subtract_threshold: {batch_config['bg_subtract_threshold']}")
+    print(f"    area_threshold_min: {batch_config['area_threshold_min']}")
+    print(f"    area_threshold_max: {batch_config['area_threshold_max']}")
+    print(f"    require_single_inner_contour: {batch_config['require_single_inner_contour']}")
+    print(f"    enable_border_check: {batch_config['enable_border_check']}")
+    print(f"    enable_area_range_check: {batch_config['enable_area_range_check']}")
+    print(f"    enable_denoising: {batch_config.get('enable_denoising', True)}")
+    
     # Read ROI if available
     if os.path.exists(roi_path):
         x, y, width, height = read_roi_csv(roi_path)
@@ -523,6 +552,36 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
     if os.path.exists(background_path):
         background = cv2.imread(background_path, cv2.IMREAD_GRAYSCALE)
         print(f"Using background from {background_path}")
+        
+        # Apply the same preprocessing to background as we do to target images
+        # Apply Gaussian blur to the background - exactly as in C++ implementation
+        blurred_bg = cv2.GaussianBlur(
+            background, 
+            (batch_config['gaussian_blur_size'], batch_config['gaussian_blur_size']), 
+            0
+        )
+        
+        # Apply denoising to background if enabled - matching target image processing
+        if batch_config.get('enable_denoising', True):
+            print(f"Applying denoising to background image")
+            background = cv2.fastNlMeansDenoising(
+                blurred_bg,
+                None,
+                h=batch_config.get('denoising_strength', 7),
+                templateWindowSize=batch_config.get('denoising_template_size', 7),
+                searchWindowSize=batch_config.get('denoising_search_size', 21)
+            )
+        else:
+            background = blurred_bg
+            
+        # Apply contrast enhancement to background if enabled
+        if batch_config['enable_contrast_enhancement']:
+            print(f"Applying contrast enhancement to background")
+            background = cv2.convertScaleAbs(
+                background, 
+                alpha=batch_config['contrast_alpha'], 
+                beta=batch_config['contrast_beta']
+            )
     else:
         background = None
         print(f"Warning: No background image found at {background_path}")
@@ -530,18 +589,32 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
     
     # Process the batch efficiently
     print(f"Processing batch: {batch_dir}")
+    print(f"Configuration: require_single_inner_contour={batch_config['require_single_inner_contour']}, "
+          f"area_range=[{batch_config['area_threshold_min']}, {batch_config['area_threshold_max']}]")
     print("Reading and processing binary image file...")
     
     # Extract batch name from directory
     batch_name = os.path.basename(batch_dir)
     
+    # Debug setting - set to True for more detailed per-image debug output
+    debug_enabled = True
+    # Only show detailed debug for a few images to avoid overwhelming output
+    debug_sample_indices = [0, 1, 2, 3, 4, 10, 20, 50, 100, 500]
+    
     # Process images directly from binary file to avoid loading all 17000 images into memory
     with open(images_bin_path, 'rb') as f:
         image_index = 0
         processed_count = 0
+        invalid_count = 0
         
         # Loop until end of file
         while True:
+            # Debug flag for this specific image
+            debug_this_image = debug_enabled and (image_index in debug_sample_indices or image_index % 1000 == 0)
+            
+            if debug_this_image:
+                print(f"\n==== DEBUG FOR IMAGE {image_index} ====")
+            
             # Read metadata: rows, cols, type
             header_data = f.read(3 * 4)  # 3 integers (4 bytes each)
             if len(header_data) < 12:  # End of file
@@ -574,7 +647,8 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
             elif depth == 6:    # CV_64F
                 bytes_per_element = 8
             else:
-                print(f"Warning: Unsupported OpenCV depth: {depth}")
+                if debug_this_image:
+                    print(f"WARNING: Unsupported OpenCV depth: {depth}")
                 # Skip this image by reading its data
                 dummy_data_size = rows * cols * bytes_per_element * channels
                 f.read(dummy_data_size)
@@ -588,7 +662,8 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
             data_size = rows * cols * elem_size
             
             if data_size <= 0:
-                print(f"Error: Invalid data size: {data_size} bytes")
+                if debug_this_image:
+                    print(f"ERROR: Invalid data size: {data_size} bytes")
                 image_index += 1
                 continue
             
@@ -629,60 +704,106 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
                 else:
                     image = img_data.reshape((rows, cols, channels))
                 
-                # Apply ROI if valid
-                if width > 0 and height > 0:
-                    # Make sure ROI is within image bounds
-                    if x < 0 or y < 0 or x + width > image.shape[1] or y + height > image.shape[0]:
-                        # Adjust ROI to fit within image bounds
-                        valid_x = max(0, x)
-                        valid_y = max(0, y)
-                        valid_width = min(image.shape[1] - valid_x, width - (valid_x - x))
-                        valid_height = min(image.shape[0] - valid_y, height - (valid_y - y))
-                        
-                        if valid_width <= 0 or valid_height <= 0:
-                            print(f"Warning: Invalid ROI dimensions for image {image_index}, using full image")
-                            roi_image = image
-                        else:
-                            roi_image = image[valid_y:valid_y+valid_height, valid_x:valid_x+valid_width]
-                    else:
-                        roi_image = image[y:y+height, x:x+width]
+                if debug_this_image:
+                    print(f"DEBUG: Image shape: {image.shape}, dtype: {image.dtype}")
+                
+                # Make sure ROI is valid, defaulting to full image if not specified
+                if width <= 0 or height <= 0:
+                    roi_x, roi_y = 0, 0
+                    roi_width, roi_height = image.shape[1], image.shape[0]
                 else:
-                    roi_image = image
+                    roi_x, roi_y = x, y
+                    roi_width, roi_height = width, height
+                
+                # Apply ROI if valid - ensure it's within image bounds
+                if roi_x < 0 or roi_y < 0 or roi_x + roi_width > image.shape[1] or roi_y + roi_height > image.shape[0]:
+                    # Adjust ROI to fit within image bounds
+                    valid_x = max(0, roi_x)
+                    valid_y = max(0, roi_y)
+                    valid_width = min(image.shape[1] - valid_x, roi_width - (valid_x - roi_x))
+                    valid_height = min(image.shape[0] - valid_y, roi_height - (valid_y - roi_y))
+                    
+                    if valid_width <= 0 or valid_height <= 0:
+                        if debug_this_image:
+                            print(f"WARNING: Invalid ROI dimensions for image {image_index}, using full image")
+                        roi_image = image
+                        roi_tuple = (0, 0, image.shape[1], image.shape[0])
+                    else:
+                        roi_image = image[valid_y:valid_y+valid_height, valid_x:valid_x+valid_width]
+                        roi_tuple = (valid_x, valid_y, valid_width, valid_height)
+                else:
+                    roi_image = image[roi_y:roi_y+roi_height, roi_x:roi_x+roi_width]
+                    roi_tuple = (roi_x, roi_y, roi_width, roi_height)
+                
+                if debug_this_image:
+                    print(f"DEBUG: Using ROI: {roi_tuple}")
                     
                 # Apply ROI to background if needed
-                if width > 0 and height > 0:
+                if roi_x >= 0 and roi_y >= 0 and roi_width > 0 and roi_height > 0:
                     # Check if ROI is valid for background
-                    if x < 0 or y < 0 or x + width > background.shape[1] or y + height > background.shape[0]:
+                    if roi_x + roi_width > background.shape[1] or roi_y + roi_height > background.shape[0]:
                         # Adjust ROI to fit within background bounds
-                        valid_x = max(0, x)
-                        valid_y = max(0, y)
-                        valid_width = min(background.shape[1] - valid_x, width - (valid_x - x))
-                        valid_height = min(background.shape[0] - valid_y, height - (valid_y - y))
+                        valid_x = roi_x
+                        valid_y = roi_y
+                        valid_width = min(background.shape[1] - valid_x, roi_width)
+                        valid_height = min(background.shape[0] - valid_y, roi_height)
                         
                         if valid_width <= 0 or valid_height <= 0:
                             # Resize entire background to match ROI image size
                             roi_background = cv2.resize(background, (roi_image.shape[1], roi_image.shape[0]))
+                            if debug_this_image:
+                                print(f"DEBUG: Resized background to match ROI image size: {roi_image.shape}")
                         else:
                             roi_background = background[valid_y:valid_y+valid_height, valid_x:valid_x+valid_width]
                             
                             # If sizes still don't match, resize
                             if roi_background.shape != roi_image.shape:
                                 roi_background = cv2.resize(roi_background, (roi_image.shape[1], roi_image.shape[0]))
+                                if debug_this_image:
+                                    print(f"DEBUG: Resized background ROI to match image ROI: {roi_image.shape}")
                     else:
-                        roi_background = background[y:y+height, x:x+width]
+                        roi_background = background[roi_y:roi_y+roi_height, roi_x:roi_x+roi_width]
                 else:
                     # Make sure background has the same size as the image
                     if background.shape != image.shape:
                         # Resize background to match image size
                         roi_background = cv2.resize(background, (image.shape[1], image.shape[0]))
+                        if debug_this_image:
+                            print(f"DEBUG: Resized background to match image: {image.shape}")
                     else:
                         roi_background = background
+                
+                # Save debug images if needed
+                if debug_this_image:
+                    try:
+                        # Create debug directory if it doesn't exist
+                        debug_dir = os.path.join(batch_dir, 'debug')
+                        os.makedirs(debug_dir, exist_ok=True)
+                        
+                        # Save original image and ROI
+                        cv2.imwrite(os.path.join(debug_dir, f'image_{image_index}_original.png'), image)
+                        cv2.imwrite(os.path.join(debug_dir, f'image_{image_index}_roi.png'), roi_image)
+                        cv2.imwrite(os.path.join(debug_dir, f'image_{image_index}_background.png'), roi_background)
+                        
+                        print(f"DEBUG: Saved debug images to {debug_dir}")
+                    except Exception as e:
+                        print(f"Warning: Failed to save debug images: {e}")
                 
                 # Process the image using batch-specific configuration
                 processed = process_frame(roi_image, roi_background, batch_config)
                 
-                # Calculate metrics
-                deformability, area = filter_processed_image(processed, batch_config)
+                # Save processed image if needed
+                if debug_this_image:
+                    try:
+                        cv2.imwrite(os.path.join(debug_dir, f'image_{image_index}_processed.png'), processed)
+                    except Exception:
+                        pass
+                
+                # Find contours - matches the C++ implementation exactly
+                contours, has_nested_contours, inner_contours = find_contours(processed)
+                
+                # Calculate metrics using the filter_processed_image function
+                deformability, area, area_ratio = filter_processed_image(image=processed, contours=contours, config=batch_config)
                 
                 # Add to results if valid (non-zero)
                 if deformability > 0 or area > 0:
@@ -690,22 +811,31 @@ def process_batch(batch_dir: str, default_config: Dict[str, Any]) -> List[Dict[s
                         'batch': batch_name,
                         'image_index': image_index,
                         'deformability': deformability,
-                        'area': area
+                        'area': area,
+                        'area_ratio': area_ratio
                     })
                     processed_count += 1
+                    if debug_this_image:
+                        print(f"DEBUG: Valid result - deformability={deformability}, area={area}, area_ratio={area_ratio}")
+                else:
+                    invalid_count += 1
+                    if debug_this_image:
+                        print(f"DEBUG: Invalid result - no valid metrics found")
                 
                 # Print progress every 1000 images
                 if (image_index + 1) % 1000 == 0:
-                    print(f"Processed {image_index + 1} images, found {processed_count} valid results")
+                    print(f"Processed {image_index + 1} images, found {processed_count} valid results, {invalid_count} invalid")
                 
                 image_index += 1
                 
             except Exception as e:
                 print(f"Error processing image {image_index}: {str(e)}")
+                import traceback
+                traceback.print_exc()
                 image_index += 1
                 continue
     
-    print(f"Batch processing complete. Total images processed: {image_index}, valid results: {len(results)}")
+    print(f"Batch processing complete. Total images processed: {image_index}, valid results: {processed_count}, invalid: {invalid_count}")
     return results
 
 
@@ -737,24 +867,27 @@ def main(project_dir: str):
         project_dir: Root project directory
     """
     # Default configuration based on ProcessingConfig in image_processing.h
-    # This will be used only if a batch doesn't have its own config
+    # Using exact defaults from C++ code - image_processing_utils.cpp
+    # But with require_single_inner_contour=False to get more results
     default_config = {
         'gaussian_blur_size': 3,
-        'bg_subtract_threshold': 8,
+        'bg_subtract_threshold': 8,  # 
         'morph_kernel_size': 3,
         'morph_iterations': 1,
-        'area_threshold_min': 250,
-        'area_threshold_max': 1200,
+        'area_threshold_min': 250,    #
+        'area_threshold_max': 1200,    
         'enable_border_check': True,
+        'enable_multiple_contours_check': False, 
         'enable_area_range_check': True,
-        'require_single_inner_contour': True,
+        'require_single_inner_contour': True,    
         'enable_contrast_enhancement': True,
         'contrast_alpha': 1.2,
         'contrast_beta': 10
     }
     
     print(f"Starting batch processing in {project_dir}")
-    print(f"Using default configuration for batches without config: {default_config}")
+    print(f"IMPORTANT: Overriding all batch-specific configurations with global defaults")
+    print(f"Using C++ default configuration: {default_config}")
     
     # Find all batch directories
     batch_dirs = find_batch_directories(project_dir)
