@@ -74,7 +74,7 @@ TABLE_TEMPLATES = {
         content_type VARCHAR(128),
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        purpose VARCHAR(256),
+        condition VARCHAR(256),
         description TEXT,
         empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
@@ -89,7 +89,7 @@ TABLE_TEMPLATES = {
         experiment_id VARCHAR(64),
         sample_type VARCHAR(64),
         magnification VARCHAR(32),
-        purpose VARCHAR(256),
+        condition VARCHAR(256),
         description TEXT,
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -106,7 +106,7 @@ TABLE_TEMPLATES = {
         time_point INTEGER,
         channel VARCHAR(32),
         sequence_id VARCHAR(64),
-        purpose VARCHAR(256),
+        condition VARCHAR(256),
         description TEXT,
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -186,13 +186,13 @@ def connect_to_target_db():
         raise
 
 def create_purpose_table(conn, table_name, template_type="standard"):
-    """Create a purpose-specific table using the specified template"""
+    """Create a condition-specific table using the specified template"""
     try:
         if template_type not in TABLE_TEMPLATES:
             logger.error(f"Template type '{template_type}' not found. Available templates: {', '.join(TABLE_TEMPLATES.keys())}")
             raise ValueError(f"Invalid template type: {template_type}")
         
-        logger.info(f"Creating purpose table '{table_name}' using {template_type} template")
+        logger.info(f"Creating condition table '{table_name}' using {template_type} template")
         cursor = conn.cursor()
         
         # Create the table if it doesn't exist
@@ -205,7 +205,7 @@ def create_purpose_table(conn, table_name, template_type="standard"):
         # Create indices for faster querying
         cursor.execute(f"""
             CREATE INDEX IF NOT EXISTS idx_{table_name}_minio_path ON {table_name} (minio_path);
-            CREATE INDEX IF NOT EXISTS idx_{table_name}_purpose ON {table_name} (purpose);
+            CREATE INDEX IF NOT EXISTS idx_{table_name}_purpose ON {table_name} (condition);
             CREATE INDEX IF NOT EXISTS idx_{table_name}_batch_id ON {table_name} (batch_id);
             CREATE INDEX IF NOT EXISTS idx_{table_name}_empty ON {table_name} (empty);
             CREATE INDEX IF NOT EXISTS idx_{table_name}_results ON {table_name} USING GIN (results);
@@ -224,9 +224,9 @@ def create_purpose_table(conn, table_name, template_type="standard"):
             """)
         
         cursor.close()
-        logger.info(f"Purpose table '{table_name}' is ready")
+        logger.info(f"Condition table '{table_name}' is ready")
     except Exception as e:
-        logger.error(f"Error creating purpose table: {e}")
+        logger.error(f"Error creating condition table: {e}")
         raise
 
 def find_matching_objects(source_conn, partial_path):
@@ -424,15 +424,15 @@ def find_matching_objects(source_conn, partial_path):
         logger.error(f"Error finding matching objects: {str(e)}")
         return []
 
-def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, description=None, batch_id=None, template_type="standard"):
+def insert_objects_to_purpose_table(target_conn, objects, table_name, condition, description=None, batch_id=None, template_type="standard"):
     """
-    Insert the matched objects into a purpose-specific table using bulk operations
+    Insert the matched objects into a condition-specific table using bulk operations
     
     Args:
         target_conn: Connection to target database
         objects: List of dictionaries containing object information
-        table_name: Name of the purpose table
-        purpose: Purpose identifier for this data set
+        table_name: Name of the condition table
+        condition: Condition identifier for this data set
         description: Optional description of this data set
         batch_id: Optional batch identifier
         template_type: Type of table template used
@@ -442,7 +442,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
         return batch_id
     
     try:
-        logger.info(f"Inserting {len(objects)} objects into purpose table '{table_name}'")
+        logger.info(f"Inserting {len(objects)} objects into condition table '{table_name}'")
         cursor = target_conn.cursor()
         
         if batch_id is None:
@@ -462,7 +462,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     last_modified TIMESTAMP,
                     content_type VARCHAR(128),
                     batch_id VARCHAR(64),
-                    purpose VARCHAR(256),
+                    condition VARCHAR(256),
                     description TEXT,
                     empty BOOLEAN,
                     results JSONB
@@ -490,7 +490,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     obj.get('last_modified', datetime.now()),
                     obj.get('content_type', ''),
                     batch_id,
-                    purpose,
+                    condition,
                     description,
                     False,
                     None  # results (JSON)
@@ -507,9 +507,9 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             logger.info(f"Inserting from temporary table to target table with conflict handling")
             cursor.execute(f"""
                 INSERT INTO {table_name} 
-                (minio_path, size, last_modified, content_type, batch_id, purpose, description, empty, results)
+                (minio_path, size, last_modified, content_type, batch_id, condition, description, empty, results)
                 SELECT 
-                    minio_path, size, last_modified, content_type, batch_id, purpose, description, empty, results
+                    minio_path, size, last_modified, content_type, batch_id, condition, description, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -517,7 +517,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     last_modified = EXCLUDED.last_modified,
                     content_type = EXCLUDED.content_type,
                     batch_id = EXCLUDED.batch_id,
-                    purpose = EXCLUDED.purpose,
+                    condition = EXCLUDED.condition,
                     description = EXCLUDED.description,
                     created_at = CURRENT_TIMESTAMP,
                     empty = TRUE,
@@ -541,7 +541,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     experiment_id VARCHAR(64),
                     sample_type VARCHAR(64),
                     magnification VARCHAR(32),
-                    purpose VARCHAR(256),
+                    condition VARCHAR(256),
                     description TEXT,
                     batch_id VARCHAR(64),
                     empty BOOLEAN,
@@ -569,7 +569,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     experiment_id,
                     sample_type,
                     magnification,
-                    purpose,
+                    condition,
                     description,
                     batch_id,
                     False,
@@ -586,10 +586,10 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             cursor.execute(f"""
                 INSERT INTO {table_name} 
                 (minio_path, size, last_modified, content_type, experiment_id, sample_type, magnification, 
-                 purpose, description, batch_id, empty, results)
+                 condition, description, batch_id, empty, results)
                 SELECT 
                     minio_path, size, last_modified, content_type, experiment_id, sample_type, magnification,
-                    purpose, description, batch_id, empty, results
+                    condition, description, batch_id, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -599,7 +599,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     experiment_id = EXCLUDED.experiment_id,
                     sample_type = EXCLUDED.sample_type,
                     magnification = EXCLUDED.magnification,
-                    purpose = EXCLUDED.purpose,
+                    condition = EXCLUDED.condition,
                     description = EXCLUDED.description,
                     batch_id = EXCLUDED.batch_id,
                     created_at = CURRENT_TIMESTAMP,
@@ -623,7 +623,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     time_point INTEGER,
                     channel VARCHAR(32),
                     sequence_id VARCHAR(64),
-                    purpose VARCHAR(256),
+                    condition VARCHAR(256),
                     description TEXT,
                     batch_id VARCHAR(64),
                     empty BOOLEAN,
@@ -652,7 +652,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                             time_point = 0
                 
                 channel = 'default'
-                sequence_id = f"seq_{purpose}"
+                sequence_id = f"seq_{condition}"
                 
                 csv_writer.writerow([
                     obj.get('minio_path', ''),
@@ -662,7 +662,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     time_point,
                     channel,
                     sequence_id,
-                    purpose,
+                    condition,
                     description,
                     batch_id,
                     False,
@@ -679,10 +679,10 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             cursor.execute(f"""
                 INSERT INTO {table_name} 
                 (minio_path, size, last_modified, content_type, time_point, channel, sequence_id,
-                 purpose, description, batch_id, empty, results)
+                 condition, description, batch_id, empty, results)
                 SELECT 
                     minio_path, size, last_modified, content_type, time_point, channel, sequence_id,
-                    purpose, description, batch_id, empty, results
+                    condition, description, batch_id, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
@@ -692,7 +692,7 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     time_point = EXCLUDED.time_point,
                     channel = EXCLUDED.channel,
                     sequence_id = EXCLUDED.sequence_id,
-                    purpose = EXCLUDED.purpose,
+                    condition = EXCLUDED.condition,
                     description = EXCLUDED.description,
                     batch_id = EXCLUDED.batch_id,
                     created_at = CURRENT_TIMESTAMP,
@@ -715,16 +715,16 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
         cursor.execute(f"DROP TABLE IF EXISTS {temp_table_name}")
         
         cursor.close()
-        logger.info(f"Successfully inserted {inserted_count} objects into purpose table '{table_name}' with batch_id: {batch_id}")
+        logger.info(f"Successfully inserted {inserted_count} objects into condition table '{table_name}' with batch_id: {batch_id}")
         return batch_id
     except Exception as e:
-        logger.error(f"Error inserting objects to purpose table: {e}")
+        logger.error(f"Error inserting objects to condition table: {e}")
         raise
 
 def list_purpose_tables(target_conn):
-    """List all purpose-specific tables in the target database"""
+    """List all condition-specific tables in the target database"""
     try:
-        logger.info("Listing purpose tables in the target database")
+        logger.info("Listing condition tables in the target database")
         cursor = target_conn.cursor()
         
         # Query all tables in the public schema
@@ -740,11 +740,11 @@ def list_purpose_tables(target_conn):
         
         return tables
     except Exception as e:
-        logger.error(f"Error listing purpose tables: {e}")
+        logger.error(f"Error listing condition tables: {e}")
         raise
 
 def get_table_summary(target_conn, table_name):
-    """Get summary information about a purpose table"""
+    """Get summary information about a condition table"""
     try:
         logger.info(f"Getting summary for table '{table_name}'")
         cursor = target_conn.cursor()
@@ -753,11 +753,11 @@ def get_table_summary(target_conn, table_name):
         cursor.execute(f"SELECT COUNT(*) as total FROM {table_name}")
         total_count = cursor.fetchone()['total']
         
-        # Get count by purpose
+        # Get count by condition
         cursor.execute(f"""
-            SELECT purpose, COUNT(*) as count
+            SELECT condition, COUNT(*) as count
             FROM {table_name}
-            GROUP BY purpose
+            GROUP BY condition
             ORDER BY count DESC
         """)
         purpose_counts = cursor.fetchall()
@@ -842,33 +842,33 @@ def get_table_summary(target_conn, table_name):
 
 def main():
     """Main function to run the script"""
-    parser = argparse.ArgumentParser(description='Create and manage purpose-specific tables in PostgreSQL for YOLO-SAM inference pipeline')
+    parser = argparse.ArgumentParser(description='Create and manage condition-specific tables in PostgreSQL for YOLO-SAM inference pipeline')
     
     # Create subparsers for different commands
     subparsers = parser.add_subparsers(dest='command', help='Command to execute')
     
     # Create table command
-    create_parser = subparsers.add_parser('create', help='Create a new purpose-specific table')
-    create_parser.add_argument('--table', type=str, required=True, help='Name of the purpose table to create')
+    create_parser = subparsers.add_parser('create', help='Create a new condition-specific table')
+    create_parser.add_argument('--table', type=str, required=True, help='Name of the condition table to create')
     create_parser.add_argument('--template', type=str, default='standard', choices=['standard', 'experiment', 'time_series'], 
                              help='Template type to use (standard, experiment, or time_series)')
     
     # Add data command
-    add_parser = subparsers.add_parser('add', help='Add data to a purpose-specific table')
+    add_parser = subparsers.add_parser('add', help='Add data to a condition-specific table')
     add_parser.add_argument('--path', type=str, required=True, help='Partial MinIO path to search for objects')
-    add_parser.add_argument('--table', type=str, required=True, help='Name of the purpose table to add data to')
-    add_parser.add_argument('--purpose', type=str, required=True, help='Purpose identifier for this data set')
+    add_parser.add_argument('--table', type=str, required=True, help='Name of the condition table to add data to')
+    add_parser.add_argument('--condition', type=str, required=True, help='Condition identifier for this data set')
     add_parser.add_argument('--description', type=str, help='Description of this data set')
     add_parser.add_argument('--batch-id', type=str, help='Optional batch identifier')
     add_parser.add_argument('--template', type=str, default='standard', choices=['standard', 'experiment', 'time_series'], 
                           help='Template type of the table (standard, experiment, or time_series)')
     
     # List tables command
-    list_parser = subparsers.add_parser('list', help='List all purpose-specific tables')
+    list_parser = subparsers.add_parser('list', help='List all condition-specific tables')
     
     # Show table summary command
-    summary_parser = subparsers.add_parser('summary', help='Show summary information for a purpose table')
-    summary_parser.add_argument('--table', type=str, required=True, help='Name of the purpose table to summarize')
+    summary_parser = subparsers.add_parser('summary', help='Show summary information for a condition table')
+    summary_parser.add_argument('--table', type=str, required=True, help='Name of the condition table to summarize')
     
     args = parser.parse_args()
     
@@ -882,9 +882,9 @@ def main():
         target_conn = connect_to_target_db()
         
         if args.command == 'create':
-            # Create a new purpose table
+            # Create a new condition table
             create_purpose_table(target_conn, args.table, args.template)
-            logger.info(f"Purpose table '{args.table}' created successfully")
+            logger.info(f"Condition table '{args.table}' created successfully")
             
         elif args.command == 'add':
             # Connect to source database
@@ -893,26 +893,26 @@ def main():
             # Find matching objects
             objects = find_matching_objects(source_conn, args.path)
             
-            # Insert objects into the purpose table
+            # Insert objects into the condition table
             batch_id = insert_objects_to_purpose_table(
                 target_conn, 
                 objects, 
                 args.table, 
-                args.purpose, 
+                args.condition, 
                 args.description, 
                 args.batch_id, 
                 args.template
             )
             
-            logger.info(f"Added {len(objects)} objects to purpose table '{args.table}' with batch ID: {batch_id}")
+            logger.info(f"Added {len(objects)} objects to condition table '{args.table}' with batch ID: {batch_id}")
             
             # Close source connection
             source_conn.close()
             
         elif args.command == 'list':
-            # List all purpose tables
+            # List all condition tables
             tables = list_purpose_tables(target_conn)
-            print("\nAvailable purpose tables:")
+            print("\nAvailable condition tables:")
             for table in tables:
                 print(f"  - {table}")
             print()
@@ -920,12 +920,12 @@ def main():
         elif args.command == 'summary':
             # Show summary for a specific table
             summary = get_table_summary(target_conn, args.table)
-            print(f"\nSummary for purpose table '{summary['table_name']}':")
+            print(f"\nSummary for condition table '{summary['table_name']}':")
             print(f"  Total objects: {summary['total_count']}")
             
-            print("\n  Objects by purpose:")
+            print("\n  Objects by condition:")
             for pc in summary['purpose_counts']:
-                print(f"    {pc['purpose']}: {pc['count']} objects")
+                print(f"    {pc['condition']}: {pc['count']} objects")
             
             print("\n  Processing status:")
             for pc in summary['empty_counts']:
