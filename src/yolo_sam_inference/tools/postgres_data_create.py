@@ -68,10 +68,9 @@ TARGET_DB_PORT = os.environ.get("TARGET_POSTGRES_PORT", SOURCE_DB_PORT)
 TABLE_TEMPLATES = {
     "standard": """
         id SERIAL PRIMARY KEY,
-        minio_path VARCHAR(1024) NOT NULL,
+        minio_path VARCHAR(1024) NOT NULL UNIQUE,
         size BIGINT,
         last_modified TIMESTAMP,
-        etag VARCHAR(256),
         content_type VARCHAR(128),
         batch_id VARCHAR(64),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -79,15 +78,13 @@ TABLE_TEMPLATES = {
         description TEXT,
         empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
-        error TEXT,
-        UNIQUE(minio_path)
+        error TEXT
     """,
     "experiment": """
         id SERIAL PRIMARY KEY,
-        minio_path VARCHAR(1024) NOT NULL,
+        minio_path VARCHAR(1024) NOT NULL UNIQUE,
         size BIGINT,
         last_modified TIMESTAMP,
-        etag VARCHAR(256),
         content_type VARCHAR(128),
         experiment_id VARCHAR(64),
         sample_type VARCHAR(64),
@@ -98,15 +95,13 @@ TABLE_TEMPLATES = {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
-        error TEXT,
-        UNIQUE(minio_path)
+        error TEXT
     """,
     "time_series": """
         id SERIAL PRIMARY KEY,
-        minio_path VARCHAR(1024) NOT NULL,
+        minio_path VARCHAR(1024) NOT NULL UNIQUE,
         size BIGINT,
         last_modified TIMESTAMP,
-        etag VARCHAR(256),
         content_type VARCHAR(128),
         time_point INTEGER,
         channel VARCHAR(32),
@@ -117,8 +112,7 @@ TABLE_TEMPLATES = {
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         empty BOOLEAN DEFAULT NULL,
         results JSONB DEFAULT NULL,
-        error TEXT,
-        UNIQUE(minio_path)
+        error TEXT
     """
 }
 
@@ -292,10 +286,10 @@ def find_matching_objects(source_conn, partial_path):
             # Use explicit column names instead of * for safety
             query = f"""
                 SELECT 
+                    id,
                     minio_path,
                     size,
                     last_modified,
-                    etag,
                     content_type
                 FROM minio_tracking.objects
                 WHERE minio_path LIKE '{search_path}'
@@ -400,10 +394,10 @@ def find_matching_objects(source_conn, partial_path):
                 for row in batch:
                     # Create a new object with only the fields we need
                     obj = {
+                        'id': row.get('id'),
                         'minio_path': row.get('minio_path', ''),
                         'size': row.get('size', 0),
                         'last_modified': row.get('last_modified', datetime.now()),
-                        'etag': row.get('etag', ''),
                         'content_type': row.get('content_type', '')
                     }
                     standardized_objects.append(obj)
@@ -466,7 +460,6 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     minio_path VARCHAR(1024) NOT NULL,
                     size BIGINT,
                     last_modified TIMESTAMP,
-                    etag VARCHAR(256),
                     content_type VARCHAR(128),
                     batch_id VARCHAR(64),
                     purpose VARCHAR(256),
@@ -495,7 +488,6 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     obj.get('minio_path', ''),
                     obj.get('size', 0),
                     obj.get('last_modified', datetime.now()),
-                    obj.get('etag', ''),
                     obj.get('content_type', ''),
                     batch_id,
                     purpose,
@@ -515,15 +507,14 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             logger.info(f"Inserting from temporary table to target table with conflict handling")
             cursor.execute(f"""
                 INSERT INTO {table_name} 
-                (minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, empty, results)
+                (minio_path, size, last_modified, content_type, batch_id, purpose, description, empty, results)
                 SELECT 
-                    minio_path, size, last_modified, etag, content_type, batch_id, purpose, description, empty, results
+                    minio_path, size, last_modified, content_type, batch_id, purpose, description, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
                     size = EXCLUDED.size,
                     last_modified = EXCLUDED.last_modified,
-                    etag = EXCLUDED.etag,
                     content_type = EXCLUDED.content_type,
                     batch_id = EXCLUDED.batch_id,
                     purpose = EXCLUDED.purpose,
@@ -546,7 +537,6 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     minio_path VARCHAR(1024) NOT NULL,
                     size BIGINT,
                     last_modified TIMESTAMP,
-                    etag VARCHAR(256),
                     content_type VARCHAR(128),
                     experiment_id VARCHAR(64),
                     sample_type VARCHAR(64),
@@ -575,7 +565,6 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     obj.get('minio_path', ''),
                     obj.get('size', 0),
                     obj.get('last_modified', datetime.now()),
-                    obj.get('etag', ''),
                     obj.get('content_type', ''),
                     experiment_id,
                     sample_type,
@@ -596,17 +585,16 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             # Insert from temporary table to target table
             cursor.execute(f"""
                 INSERT INTO {table_name} 
-                (minio_path, size, last_modified, etag, content_type, experiment_id, sample_type, magnification, 
+                (minio_path, size, last_modified, content_type, experiment_id, sample_type, magnification, 
                  purpose, description, batch_id, empty, results)
                 SELECT 
-                    minio_path, size, last_modified, etag, content_type, experiment_id, sample_type, magnification,
+                    minio_path, size, last_modified, content_type, experiment_id, sample_type, magnification,
                     purpose, description, batch_id, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
                     size = EXCLUDED.size,
                     last_modified = EXCLUDED.last_modified,
-                    etag = EXCLUDED.etag,
                     content_type = EXCLUDED.content_type,
                     experiment_id = EXCLUDED.experiment_id,
                     sample_type = EXCLUDED.sample_type,
@@ -631,7 +619,6 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     minio_path VARCHAR(1024) NOT NULL,
                     size BIGINT,
                     last_modified TIMESTAMP,
-                    etag VARCHAR(256),
                     content_type VARCHAR(128),
                     time_point INTEGER,
                     channel VARCHAR(32),
@@ -671,7 +658,6 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
                     obj.get('minio_path', ''),
                     obj.get('size', 0),
                     obj.get('last_modified', datetime.now()),
-                    obj.get('etag', ''),
                     obj.get('content_type', ''),
                     time_point,
                     channel,
@@ -692,17 +678,16 @@ def insert_objects_to_purpose_table(target_conn, objects, table_name, purpose, d
             # Insert from temporary table to target table
             cursor.execute(f"""
                 INSERT INTO {table_name} 
-                (minio_path, size, last_modified, etag, content_type, time_point, channel, sequence_id,
+                (minio_path, size, last_modified, content_type, time_point, channel, sequence_id,
                  purpose, description, batch_id, empty, results)
                 SELECT 
-                    minio_path, size, last_modified, etag, content_type, time_point, channel, sequence_id,
+                    minio_path, size, last_modified, content_type, time_point, channel, sequence_id,
                     purpose, description, batch_id, empty, results
                 FROM {temp_table_name}
                 ON CONFLICT (minio_path) 
                 DO UPDATE SET 
                     size = EXCLUDED.size,
                     last_modified = EXCLUDED.last_modified,
-                    etag = EXCLUDED.etag,
                     content_type = EXCLUDED.content_type,
                     time_point = EXCLUDED.time_point,
                     channel = EXCLUDED.channel,

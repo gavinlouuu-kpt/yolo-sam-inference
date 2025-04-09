@@ -466,6 +466,42 @@ class ParallelCellSegmentationPipeline:
         
         self.run_id = self._generate_run_id()
     
+    def process_image(self, image: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray], List[float]]:
+        """
+        Process a single image (numpy array) through the pipeline.
+        
+        Args:
+            image: Input image as numpy array (RGB format)
+            
+        Returns:
+            Tuple containing (boxes, masks, scores)
+        """
+        # Use the first pipeline for direct image processing
+        pipeline = self.pipelines[0]
+        
+        # Detect cells with YOLO
+        start_time = time.time()
+        yolo_results = pipeline.yolo_model(image)[0]
+        boxes = yolo_results.boxes.xyxy.cpu().numpy()
+        scores = yolo_results.boxes.conf.cpu().numpy()
+        
+        # Return empty results if no cells detected
+        if len(boxes) == 0:
+            return boxes, [], scores
+        
+        # Prepare SAM inputs
+        sam_inputs = pipeline.sam_processor(image, return_tensors="pt")
+        processed_pixel_values = sam_inputs['pixel_values'].to(self.device)
+        
+        # Process each detected cell with SAM
+        masks = []
+        for box in boxes:
+            mask = pipeline._process_sam_mask(image, box, processed_pixel_values)
+            masks.append(mask)
+        
+        # Return detection results
+        return boxes, masks, scores
+    
     @staticmethod
     def _generate_run_id() -> str:
         """Generate a unique run ID for this pipeline instance."""
