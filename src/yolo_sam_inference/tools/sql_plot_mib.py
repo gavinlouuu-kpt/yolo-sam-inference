@@ -6,11 +6,14 @@ from scipy.stats import gaussian_kde
 from bokeh.plotting import figure, output_file, save, show
 from bokeh.models import (ColumnDataSource, CustomJS, CheckboxGroup, ColorBar, 
                          LinearColorMapper, HoverTool, Legend, LegendItem,
-                         Select, RangeSlider, Button, Div, Panel, Tabs)
+                         Select, RangeSlider, Button, Div, Panel, Tabs, Slider)
 from bokeh.layouts import column, row, layout
 from bokeh.palettes import Viridis256, Turbo256
 from bokeh.transform import linear_cmap
 from bokeh.io import curdoc
+from bokeh.server.server import Server
+from bokeh.application import Application
+from bokeh.application.handlers.function import FunctionHandler
 import time
 import argparse
 from pathlib import Path
@@ -583,294 +586,329 @@ class SQLPlotter:
     
     def create_interactive_plot(self, output_path=None, show_plot=True):
         """
-        Create an interactive Bokeh plot
+        Create an interactive client-side Bokeh plot with HTML output
         
         Args:
             output_path (str): Path to save the HTML output
             show_plot (bool): Whether to show the plot in browser
         """
-        # Create figure with appropriate styling
-        tooltips = [
-            ("Condition", "@condition"),
-            ("Cell Size", "@area{0,0.00} μm²"),
-            ("Deformation", "@deformability{0.0000}"),
-            ("Density", "@density{0.00}")
-        ]
-        
-        p = figure(
-            width=800, height=600,
-            tools="pan,wheel_zoom,box_zoom,reset,save",
-            x_axis_label="Cell Size (μm²)",
-            y_axis_label="Deformation",
-            tooltips=tooltips
-        )
-        
-        # Apply styling for clean, publication-quality look
-        p.xaxis.axis_label_text_font_size = "14pt"
-        p.yaxis.axis_label_text_font_size = "14pt"
-        p.xaxis.major_label_text_font_size = "12pt"
-        p.yaxis.major_label_text_font_size = "12pt"
-        p.grid.grid_line_alpha = 0.3
-        
-        # Remove top and right spines
-        p.outline_line_color = None
-        p.xaxis.axis_line_width = 2
-        p.yaxis.axis_line_width = 2
-        
-        # Initial data
+        # Get data
         data_by_condition = self._get_data_for_plot()
         
         # Check if we have data
         if not data_by_condition:
             print("No data available for plotting. Creating empty plot.")
-            # Create empty plot with message
+            p = figure(width=800, height=600, title="No data available")
             p.text(x=0, y=0, text=['No data available for plotting'],
                    text_font_size='20pt', text_align='center')
             
-            # Create empty layout
-            l = layout([[p]])
-            
-            # Output
             if output_path:
                 output_file(output_path)
-                save(l)
-                print(f"Empty plot saved to {output_path}")
-            
+                save(p)
+                
             if show_plot:
-                show(l)
+                show(p)
+                
+            return p
             
-            return l
+        # Combine all data into a single DataFrame with condition column
+        all_data = pd.concat(data_by_condition.values(), axis=0)
         
-        # Data sources for each condition
-        sources = {}
-        renderers = {}
+        # Find global min/max values for scaling
+        min_density = all_data['density'].min()
+        max_density = all_data['density'].max()
+        min_area = all_data['area'].min()
+        max_area = all_data['area'].max()
+        min_deformability = all_data['deformability'].min()
+        max_deformability = all_data['deformability'].max()
         
-        # Find global min/max density values for consistent color mapping
-        min_density = float('inf')
-        max_density = float('-inf')
-        
-        for condition, df in data_by_condition.items():
-            if 'density' in df.columns:
-                min_density = min(min_density, df['density'].min())
-                max_density = max(max_density, df['density'].max())
-        
-        # Handle case where min/max are the same or invalid
-        if min_density >= max_density or min_density == float('inf') or max_density == float('-inf'):
-            print("Warning: Invalid density range. Using default values.")
-            min_density = 0
-            max_density = 1
-        
-        print(f"Density range for coloring: {min_density} to {max_density}")
-        
-        # Color mapper for density
+        # Create color mapper
         color_mapper = LinearColorMapper(palette=Turbo256, low=min_density, high=max_density)
+        
+        # Create hover tool
+        hover = HoverTool(tooltips=[
+            ("Condition", "@condition"),
+            ("Cell Size", "@area{0,0.00} μm²"),
+            ("Deformation", "@deformability{0.0000}"),
+            ("Density", "@density{0.00}")
+        ])
+        
+        # Create figure
+        p = figure(
+            width=800, height=600,
+            tools=[hover, "pan", "wheel_zoom", "box_zoom", "reset", "save"],
+            x_axis_label="Cell Size (μm²)",
+            y_axis_label="Deformation",
+            title="Cell Morphology Data"
+        )
+        
+        # Style the plot
+        p.title.text_font_size = '16pt'
+        p.xaxis.axis_label_text_font_size = "14pt"
+        p.yaxis.axis_label_text_font_size = "14pt"
+        p.xaxis.major_label_text_font_size = "12pt"
+        p.yaxis.major_label_text_font_size = "12pt"
+        p.grid.grid_line_alpha = 0.3
+        p.outline_line_color = None
+        p.xaxis.axis_line_width = 2
+        p.yaxis.axis_line_width = 2
+        
+        # Create separate renderers for each condition with unique colors
+        renderers = {}
+        palette = Turbo256[::max(1, 256 // len(data_by_condition))][:len(data_by_condition)]
+        
+        for i, (condition, df) in enumerate(data_by_condition.items()):
+            source = ColumnDataSource(data=df)
+            color = palette[i]
+            renderer = p.scatter(
+                x='area', 
+                y='deformability', 
+                source=source,
+                size=8, 
+                fill_color=color,
+                fill_alpha=0.7,
+                line_color=None,
+                legend_label=condition,
+                name=f"scatter_{condition}"
+            )
+            renderers[condition] = {
+                'renderer': renderer,
+                'source': source,
+                'original_data': ColumnDataSource(data=df),
+                'color': color
+            }
+        
+        # Add color bar for density
+        p.scatter(
+            x=[], y=[], 
+            size=0,
+            fill_color={'field': 'density', 'transform': color_mapper},
+        )
+        
         color_bar = ColorBar(
             color_mapper=color_mapper,
-            location=(0, 0),
             title="Density",
-            title_text_font_size="12pt",
-            title_text_font_style="normal"
+            location=(0, 0),
+            title_text_font_size="12pt"
         )
         p.add_layout(color_bar, 'right')
         
-        # Create renderers for each condition
-        legend_items = []
-        for i, condition in enumerate(self.conditions):
-            if condition in data_by_condition:
-                df = data_by_condition[condition]
-                
-                print(f"Rendering condition '{condition}' with {len(df)} points")
-                
-                try:
-                    # Prepare data source
-                    source_data = {
-                        'area': df['area'],
-                        'deformability': df['deformability'],
-                        'density': df['density'],
-                        'condition': [condition] * len(df),
-                        'size': [8] * len(df)  # Create a list of the same size as the dataframe
-                    }
-                    
-                    # Normalize density for better visualization
-                    if len(df) > 0:
-                        print(f"Density range for condition {condition}: {df['density'].min()} to {df['density'].max()}")
-                    
-                    sources[condition] = ColumnDataSource(data=source_data)
-                    
-                    # Add scatter plot
-                    marker = self.markers[i % len(self.markers)]
-                    r = p.scatter(
-                        'area', 'deformability', 
-                        source=sources[condition],
-                        size='size',
-                        marker=marker,
-                        fill_color={'field': 'density', 'transform': color_mapper},
-                        fill_alpha=0.6,
-                        line_alpha=0,
-                    )
-                    
-                    renderers[condition] = r
-                    legend_items.append(LegendItem(label=condition, renderers=[r]))
-                except Exception as e:
-                    print(f"Error rendering condition '{condition}': {e}")
-                    continue
-        
-        # Check if we have renderers
-        if not renderers:
-            print("No renderers could be created. Check data format.")
-            p.text(x=0, y=0, text=['Data format error - no renderers could be created'],
-                   text_font_size='20pt', text_align='center')
-        else:
-            # Add legend
-            legend = Legend(items=legend_items, location="top_right")
-            legend.click_policy = "hide"
-            p.add_layout(legend, 'right')
-            
-            # Add hover tool
-            hover = HoverTool()
-            hover.tooltips = tooltips
-            p.add_tools(hover)
+        # Configure legend
+        p.legend.click_policy = "hide"
+        p.legend.location = "top_right"
         
         # Create widgets
-        # Condition selector
-        checkbox_group = CheckboxGroup(
-            labels=self.conditions, 
-            active=list(range(len(self.conditions))),
+        
+        # Condition selection
+        conditions = list(data_by_condition.keys())
+        condition_select = CheckboxGroup(
+            labels=conditions,
+            active=list(range(len(conditions))),
             width=200
         )
         
-        # Filters for area and deformability
-        # Get min/max values
-        cursor = self.conn.execute('''
-            SELECT MIN(area), MAX(area), MIN(deformability), MAX(deformability)
-            FROM cell_data
-        ''')
-        min_area, max_area, min_def, max_def = cursor.fetchone()
-        
+        # Global filters
         area_slider = RangeSlider(
-            title="Cell Size Range (μm²)", 
-            start=min_area, end=max_area,
-            value=(min_area, max_area), step=10,
+            title="Cell Size Range (μm²)",
+            start=min_area, 
+            end=max_area,
+            value=(min_area, max_area),
+            step=(max_area - min_area) / 100,
             width=400
         )
         
-        def_slider = RangeSlider(
-            title="Deformation Range", 
-            start=min_def, end=max_def,
-            value=(min_def, max_def), step=0.01,
+        deform_slider = RangeSlider(
+            title="Deformability Range",
+            start=min_deformability, 
+            end=max_deformability,
+            value=(min_deformability, max_deformability),
+            step=(max_deformability - min_deformability) / 100,
             width=400
         )
         
-        # Update button
+        density_slider = RangeSlider(
+            title="Density Range",
+            start=min_density, 
+            end=max_density,
+            value=(min_density, max_density),
+            step=(max_density - min_density) / 100,
+            width=400
+        )
+        
+        opacity_slider = Slider(
+            title="Point Opacity",
+            start=0.1, 
+            end=1.0,
+            value=0.7,
+            step=0.05,
+            width=400
+        )
+        
+        point_size_slider = Slider(
+            title="Point Size",
+            start=2, 
+            end=15,
+            value=8,
+            step=1,
+            width=400
+        )
+        
+        # Create update button
         update_button = Button(label="Update Plot", button_type="primary", width=200)
         
         # Stats display
         stats_div = Div(text="", width=400)
         
-        # Initial statistics
-        total_count = sum(len(df) for df in data_by_condition.values())
-        stats_html = "<h3>Statistics</h3>"
-        for condition, df in data_by_condition.items():
-            stats_html += f"<p><b>{condition}</b>: {len(df)} cells</p>"
-        stats_html += f"<p><b>Total</b>: {total_count} cells</p>"
-        stats_div.text = stats_html
+        # Create JavaScript callback code
+        js_code = """
+        // Get selected conditions
+        const selected_indices = condition_select.active;
+        const selected_conditions = [];
+        for (let i = 0; i < selected_indices.length; i++) {
+            selected_conditions.push(conditions[selected_indices[i]]);
+        }
         
-        # JS callback for widget interaction and filtering (using only JS, no Python callbacks)
-        callback = CustomJS(
-            args=dict(
-                sources=sources,
-                renderers=renderers,
-                checkbox=checkbox_group,
-                area_slider=area_slider,
-                def_slider=def_slider,
-                stats_div=stats_div,
-                conditions=self.conditions
-            ),
-            code="""
-            // Get selected conditions
-            const active = checkbox.active;
-            const selected_conditions = [];
-            for (let i = 0; i < active.length; i++) {
-                selected_conditions.push(conditions[active[i]]);
-            }
+        // Stats tracking
+        let total_visible = 0;
+        const stats = {};
+        
+        // Update each renderer
+        for (const condition in renderers) {
+            const renderer_info = renderers[condition];
+            const renderer = renderer_info.renderer;
+            const source = renderer_info.source;
+            const original_data = renderer_info.original_data.data;
             
-            // Update visibility of renderers
-            for (const condition in renderers) {
-                if (selected_conditions.includes(condition)) {
-                    renderers[condition].visible = true;
-                } else {
-                    renderers[condition].visible = false;
-                }
-            }
+            // Set visibility
+            renderer.visible = selected_conditions.includes(condition);
             
-            // Get filter ranges
-            const min_area = area_slider.value[0];
-            const max_area = area_slider.value[1];
-            const min_def = def_slider.value[0];
-            const max_def = def_slider.value[1];
-            
-            // Update statistics
-            let total_count = 0;
-            let stats_html = "<h3>Statistics</h3>";
-            
-            for (const condition in sources) {
-                if (selected_conditions.includes(condition)) {
-                    const source = sources[condition];
-                    const data = source.data;
-                    let visible_count = 0;
-                    
-                    // Count points that pass the filters
-                    for (let i = 0; i < data.area.length; i++) {
-                        const area = data.area[i];
-                        const def = data.deformability[i];
-                        
-                        if (area >= min_area && area <= max_area && 
-                            def >= min_def && def <= max_def) {
-                            visible_count++;
-                        }
+            if (renderer.visible) {
+                // Apply filters
+                const filtered_area = [];
+                const filtered_deform = [];
+                const filtered_density = [];
+                const filtered_condition = [];
+                
+                for (let i = 0; i < original_data.area.length; i++) {
+                    if (
+                        original_data.area[i] >= area_slider.value[0] &&
+                        original_data.area[i] <= area_slider.value[1] &&
+                        original_data.deformability[i] >= deform_slider.value[0] &&
+                        original_data.deformability[i] <= deform_slider.value[1] &&
+                        original_data.density[i] >= density_slider.value[0] &&
+                        original_data.density[i] <= density_slider.value[1]
+                    ) {
+                        filtered_area.push(original_data.area[i]);
+                        filtered_deform.push(original_data.deformability[i]);
+                        filtered_density.push(original_data.density[i]);
+                        filtered_condition.push(original_data.condition[i]);
                     }
-                    
-                    stats_html += `<p><b>${condition}</b>: ${visible_count} cells</p>`;
-                    total_count += visible_count;
                 }
+                
+                // Update renderer source
+                source.data = {
+                    'area': filtered_area,
+                    'deformability': filtered_deform,
+                    'density': filtered_density,
+                    'condition': filtered_condition
+                };
+                
+                // Update appearance
+                renderer.glyph.fill_alpha = opacity_slider.value;
+                renderer.glyph.size = point_size_slider.value;
+                
+                // Store stats
+                stats[condition] = {
+                    visible: filtered_area.length,
+                    total: original_data.area.length
+                };
+                total_visible += filtered_area.length;
+            } else {
+                stats[condition] = { 
+                    visible: 0, 
+                    total: original_data.area.length 
+                };
             }
-            
-            stats_html += `<p><b>Total</b>: ${total_count} cells</p>`;
-            stats_div.text = stats_html;
-            """
-        )
+        }
         
-        # Attach callbacks to widgets
-        checkbox_group.js_on_change('active', callback)
-        area_slider.js_on_change('value', callback)
-        def_slider.js_on_change('value', callback)
-        update_button.js_on_click(callback)
+        // Update statistics display
+        let stats_html = "<h3>Statistics</h3>";
+        for (const condition of selected_conditions) {
+            if (stats[condition]) {
+                const visible = stats[condition].visible;
+                const total = stats[condition].total;
+                const percentage = total > 0 ? (visible / total * 100).toFixed(1) : 0;
+                stats_html += `<p><b>${condition}</b>: ${visible} cells visible out of ${total} total (${percentage}%)</p>`;
+            }
+        }
+        stats_html += `<p><b>Total visible</b>: ${total_visible} cells</p>`;
+        stats_div.text = stats_html;
+        """
+        
+        # Create args dict for JS callback
+        js_args = {
+            'condition_select': condition_select,
+            'conditions': conditions,
+            'area_slider': area_slider,
+            'deform_slider': deform_slider,
+            'density_slider': density_slider,
+            'opacity_slider': opacity_slider,
+            'point_size_slider': point_size_slider,
+            'stats_div': stats_div,
+            'renderers': renderers
+        }
+        
+        # Create JS callback
+        js_callback = CustomJS(args=js_args, code=js_code)
+        
+        # Connect JS callback to all widgets
+        update_button.js_on_click(js_callback)
+        condition_select.js_on_change('active', js_callback)
+        area_slider.js_on_change('value', js_callback)
+        deform_slider.js_on_change('value', js_callback)
+        density_slider.js_on_change('value', js_callback)
+        opacity_slider.js_on_change('value', js_callback)
+        point_size_slider.js_on_change('value', js_callback)
+        
+        # Initialize the statistics display
+        initial_stats_html = "<h3>Statistics</h3>"
+        for condition, render_info in renderers.items():
+            count = len(render_info['original_data'].data['area'])
+            initial_stats_html += f"<p><b>{condition}</b>: {count} cells visible out of {count} total (100.0%)</p>"
+        
+        total_count = sum(len(render_info['original_data'].data['area']) for render_info in renderers.values())
+        initial_stats_html += f"<p><b>Total visible</b>: {total_count} cells</p>"
+        stats_div.text = initial_stats_html
         
         # Create layout
         controls = column(
             Div(text="<h2>Cell Data Visualization</h2>"),
             Div(text="<h3>Select Conditions:</h3>"),
-            checkbox_group,
+            condition_select,
+            Div(text="<h3>Filter Data:</h3>"),
             area_slider,
-            def_slider,
+            deform_slider,
+            density_slider,
+            Div(text="<h3>Appearance:</h3>"),
+            opacity_slider,
+            point_size_slider,
             update_button,
             stats_div
         )
         
-        l = layout([
-            [controls, p]
-        ])
+        # Create final layout
+        layout_obj = layout([[controls, p]])
         
-        # Output
+        # Handle output
         if output_path:
             output_file(output_path)
-            save(l)
+            save(layout_obj)
             print(f"Plot saved to {output_path}")
         
         if show_plot:
-            show(l)
+            show(layout_obj)
         
-        return l
+        return layout_obj
     
     def close(self):
         """Close database connection"""
@@ -913,7 +951,7 @@ def main():
     try:
         plotter = SQLPlotter(data_path=args.data, db_path=args.db, use_gpu=use_gpu)
         
-        # Create and show plot
+        # Create and show static plot
         plotter.create_interactive_plot(
             output_path=args.output,
             show_plot=not args.no_show
@@ -921,6 +959,9 @@ def main():
         
         # Clean up
         plotter.close()
+        
+        print(f"\nInteractive plot has been created and saved to {args.output}")
+        print("You can open this HTML file in any modern web browser to view and interact with the plot.")
     
     except Exception as e:
         print(f"Error: {e}")
