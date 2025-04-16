@@ -709,7 +709,7 @@ class SQLPlotter:
         
         # Global filters
         area_slider = RangeSlider(
-            title="Cell Size Range (μm²)",
+            title="Cell Size Range (pixels)",
             start=min_area, 
             end=max_area,
             value=(min_area, max_area),
@@ -739,7 +739,7 @@ class SQLPlotter:
             title="Point Opacity",
             start=0.1, 
             end=1.0,
-            value=0.7,
+            value=0.3,
             step=0.05,
             width=400
         )
@@ -748,13 +748,11 @@ class SQLPlotter:
             title="Point Size",
             start=2, 
             end=15,
-            value=8,
+            value=5,
             step=1,
             width=400
         )
         
-        # Create update button
-        update_button = Button(label="Update Plot", button_type="primary", width=200)
         
         # Stats display
         stats_div = Div(text="", width=400)
@@ -862,7 +860,6 @@ class SQLPlotter:
         js_callback = CustomJS(args=js_args, code=js_code)
         
         # Connect JS callback to all widgets
-        update_button.js_on_click(js_callback)
         condition_select.js_on_change('active', js_callback)
         area_slider.js_on_change('value', js_callback)
         deform_slider.js_on_change('value', js_callback)
@@ -892,7 +889,6 @@ class SQLPlotter:
             Div(text="<h3>Appearance:</h3>"),
             opacity_slider,
             point_size_slider,
-            update_button,
             stats_div
         )
         
