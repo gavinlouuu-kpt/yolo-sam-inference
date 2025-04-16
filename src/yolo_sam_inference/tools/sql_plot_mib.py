@@ -628,7 +628,7 @@ class SQLPlotter:
         # Create hover tool
         hover = HoverTool(tooltips=[
             ("Condition", "@condition"),
-            ("Cell Size", "@area{0,0.00} μm²"),
+            ("Cell Size", "@area{0,0.00} pixels"),
             ("Deformation", "@deformability{0.0000}"),
             ("Density", "@density{0.00}")
         ])
@@ -637,7 +637,7 @@ class SQLPlotter:
         p = figure(
             width=800, height=600,
             tools=[hover, "pan", "wheel_zoom", "box_zoom", "reset", "save"],
-            x_axis_label="Cell Size (μm²)",
+            x_axis_label="Cell Size (pixels)",
             y_axis_label="Deformation",
             title="Cell Morphology Data"
         )
