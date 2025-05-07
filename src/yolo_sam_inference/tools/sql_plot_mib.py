@@ -142,10 +142,34 @@ class SQLPlotter:
             print("Warning: 'condition' column not found. Creating default condition 'Sample'.")
             data['condition'] = 'Sample'
         
-        # Clean data
+        # Clean data: replace Excel error values with NaN first
+        excel_errors = ['#NAME?', '#DIV/0!', '#N/A', '#NULL!', '#NUM!', '#REF!', '#VALUE!', '#ERROR!']
+        
+        # Function to clean values
+        def clean_value(val):
+            if isinstance(val, str) and any(err in val for err in excel_errors):
+                print(f"Converting Excel error '{val}' to NaN")
+                return np.nan
+            return val
+        
+        # Apply to numeric columns
+        numeric_columns = ['area', 'deformability', 'area_ratio', 'ringratio']
+        for col in numeric_columns:
+            if col in data.columns:
+                data[col] = data[col].apply(clean_value)
+        
+        # Now drop rows with NaN in required columns
         data = data.dropna(subset=['area', 'deformability'])
+        
+        # Remove infinite values
         data = data[(data['area'] != float('inf')) & (data['area'] != float('-inf'))]
         data = data[(data['deformability'] != float('inf')) & (data['deformability'] != float('-inf'))]
+        
+        # Report data cleaning results
+        original_rows = len(data)
+        cleaned_rows = len(data.dropna())
+        if original_rows != cleaned_rows:
+            print(f"Removed {original_rows - cleaned_rows} rows with invalid data ({(original_rows - cleaned_rows)/original_rows*100:.1f}%)")
         
         # Connect to database
         self._connect_db()
@@ -158,7 +182,8 @@ class SQLPlotter:
             area REAL,
             deformability REAL,
             area_ratio REAL,
-            density REAL DEFAULT 0
+            density REAL DEFAULT 0,
+            ringratio REAL
         )
         ''')
         
@@ -176,17 +201,44 @@ class SQLPlotter:
             for _, row in batch.iterrows():
                 try:
                     condition = row.get('condition', 'Unknown')
-                    area = float(row['area'])
-                    deformability = float(row['deformability'])
-                    area_ratio = float(row.get('area_ratio', 1.0)) if 'area_ratio' in row else 1.0
                     
-                    values.append((condition, area, deformability, area_ratio))
+                    # Extra validation to prevent issues with float conversion
+                    try:
+                        area = float(row['area'])
+                        if np.isnan(area) or np.isinf(area):
+                            raise ValueError(f"Invalid area value: {row['area']}")
+                    except (ValueError, TypeError):
+                        continue  # Skip this row
+                        
+                    try:
+                        deformability = float(row['deformability'])
+                        if np.isnan(deformability) or np.isinf(deformability):
+                            raise ValueError(f"Invalid deformability value: {row['deformability']}")
+                    except (ValueError, TypeError):
+                        continue  # Skip this row
+                    
+                    # Handle optional columns gracefully
+                    try:
+                        area_ratio = float(row.get('area_ratio', 1.0)) if 'area_ratio' in row else 1.0
+                        if np.isnan(area_ratio) or np.isinf(area_ratio):
+                            area_ratio = 1.0  # Default value for invalid data
+                    except (ValueError, TypeError):
+                        area_ratio = 1.0
+                        
+                    try:
+                        ringratio = float(row.get('ringratio', 0.0)) if 'ringratio' in row else 0.0
+                        if np.isnan(ringratio) or np.isinf(ringratio):
+                            ringratio = 0.0  # Default value for invalid data
+                    except (ValueError, TypeError):
+                        ringratio = 0.0
+                    
+                    values.append((condition, area, deformability, area_ratio, ringratio))
                 except (ValueError, KeyError) as e:
                     print(f"Skipping row due to error: {e}")
             
             # Insert batch
             self.conn.executemany(
-                'INSERT INTO cell_data (condition, area, deformability, area_ratio) VALUES (?, ?, ?, ?)',
+                'INSERT INTO cell_data (condition, area, deformability, area_ratio, ringratio) VALUES (?, ?, ?, ?, ?)',
                 values
             )
             self.conn.commit()  # Commit after each batch
@@ -624,6 +676,34 @@ class SQLPlotter:
         min_deformability = all_data['deformability'].min()
         max_deformability = all_data['deformability'].max()
         
+        # Check for RingRatio column
+        has_ringratio = 'ringratio' in all_data.columns
+        
+        if has_ringratio:
+            # Clean RingRatio data: Filter out NaN, negative, and zero values
+            # Create a filtered copy for RingRatio analysis only
+            ringratio_data = all_data.copy()
+            ringratio_data = ringratio_data[~ringratio_data['ringratio'].isna()]  # Remove NaN
+            ringratio_data = ringratio_data[ringratio_data['ringratio'] > 0]  # Remove <= 0
+            
+            if len(ringratio_data) == 0:
+                print("Warning: No valid RingRatio values found after filtering. Disabling RingRatio histogram.")
+                has_ringratio = False
+            else:
+                print(f"Found {len(ringratio_data)} valid RingRatio values for plotting.")
+                min_ringratio = ringratio_data['ringratio'].min()
+                max_ringratio = ringratio_data['ringratio'].max()
+                
+                # Update the data_by_condition with filtered RingRatio values
+                for condition in data_by_condition.keys():
+                    cond_data = data_by_condition[condition]
+                    cond_data = cond_data[~cond_data['ringratio'].isna()]
+                    cond_data = cond_data[cond_data['ringratio'] > 0]
+                    if len(cond_data) > 0:
+                        data_by_condition[condition] = cond_data
+                    else:
+                        print(f"Warning: No valid RingRatio values for condition '{condition}'")
+        
         # Create color mapper
         color_mapper = LinearColorMapper(palette=Turbo256, low=min_density, high=max_density)
         
@@ -635,8 +715,11 @@ class SQLPlotter:
             ("Density", "@density{0.00}")
         ])
         
+        if has_ringratio:
+            hover.tooltips.append(("Ring Ratio", "@ringratio{0.0000}"))
+        
         # Create figure
-        p = figure(
+        scatter_plot = figure(
             width=800, height=600,
             tools=[hover, "pan", "wheel_zoom", "box_zoom", "reset", "save"],
             x_axis_label="Cell Size (pixels)",
@@ -645,24 +728,24 @@ class SQLPlotter:
         )
         
         # Style the plot
-        p.title.text_font_size = '16pt'
-        p.xaxis.axis_label_text_font_size = "14pt"
-        p.yaxis.axis_label_text_font_size = "14pt"
-        p.xaxis.major_label_text_font_size = "12pt"
-        p.yaxis.major_label_text_font_size = "12pt"
-        p.grid.grid_line_alpha = 0.3
-        p.outline_line_color = None
-        p.xaxis.axis_line_width = 2
-        p.yaxis.axis_line_width = 2
+        scatter_plot.title.text_font_size = '16pt'
+        scatter_plot.xaxis.axis_label_text_font_size = "14pt"
+        scatter_plot.yaxis.axis_label_text_font_size = "14pt"
+        scatter_plot.xaxis.major_label_text_font_size = "12pt"
+        scatter_plot.yaxis.major_label_text_font_size = "12pt"
+        scatter_plot.grid.grid_line_alpha = 0.3
+        scatter_plot.outline_line_color = None
+        scatter_plot.xaxis.axis_line_width = 2
+        scatter_plot.yaxis.axis_line_width = 2
         
         # Create separate renderers for each condition with unique colors
-        renderers = {}
+        scatter_renderers = {}
         palette = Turbo256[::max(1, 256 // len(data_by_condition))][:len(data_by_condition)]
         
         for i, (condition, df) in enumerate(data_by_condition.items()):
             source = ColumnDataSource(data=df)
             color = palette[i]
-            renderer = p.scatter(
+            renderer = scatter_plot.scatter(
                 x='area', 
                 y='deformability', 
                 source=source,
@@ -673,7 +756,7 @@ class SQLPlotter:
                 legend_label=condition,
                 name=f"scatter_{condition}"
             )
-            renderers[condition] = {
+            scatter_renderers[condition] = {
                 'renderer': renderer,
                 'source': source,
                 'original_data': ColumnDataSource(data=df),
@@ -681,7 +764,7 @@ class SQLPlotter:
             }
         
         # Add color bar for density
-        p.scatter(
+        scatter_plot.scatter(
             x=[], y=[], 
             size=0,
             fill_color={'field': 'density', 'transform': color_mapper},
@@ -693,11 +776,86 @@ class SQLPlotter:
             location=(0, 0),
             title_text_font_size="12pt"
         )
-        p.add_layout(color_bar, 'right')
+        scatter_plot.add_layout(color_bar, 'right')
         
         # Configure legend
-        p.legend.click_policy = "hide"
-        p.legend.location = "top_right"
+        scatter_plot.legend.click_policy = "hide"
+        scatter_plot.legend.location = "top_right"
+        
+        # Create RingRatio histogram plot if data available
+        ringratio_plot = None
+        hist_renderers = {}
+        
+        if has_ringratio:
+            # Create a new figure for the histogram
+            ringratio_plot = figure(
+                width=800, height=600,
+                tools=["pan", "wheel_zoom", "box_zoom", "reset", "save"],
+                x_axis_label="Ring Ratio",
+                y_axis_label="Count",
+                title="Ring Ratio Distribution"
+            )
+            
+            # Style the histogram plot
+            ringratio_plot.title.text_font_size = '16pt'
+            ringratio_plot.xaxis.axis_label_text_font_size = "14pt"
+            ringratio_plot.yaxis.axis_label_text_font_size = "14pt"
+            ringratio_plot.xaxis.major_label_text_font_size = "12pt"
+            ringratio_plot.yaxis.major_label_text_font_size = "12pt"
+            ringratio_plot.grid.grid_line_alpha = 0.3
+            ringratio_plot.outline_line_color = None
+            ringratio_plot.xaxis.axis_line_width = 2
+            ringratio_plot.yaxis.axis_line_width = 2
+            
+            # Create histograms for each condition
+            for i, (condition, df) in enumerate(data_by_condition.items()):
+                if 'ringratio' in df.columns and not df['ringratio'].isnull().all():
+                    # Filter out invalid values for histogram
+                    valid_data = df[~df['ringratio'].isna()]  # Remove NaN
+                    valid_data = valid_data[valid_data['ringratio'] > 0]  # Remove <= 0
+                    
+                    if len(valid_data) > 0:
+                        # Create histogram data - using a standardized approach for all conditions
+                        hist, edges = np.histogram(valid_data['ringratio'], 
+                                                bins=30, 
+                                                range=(min_ringratio, max_ringratio))
+                        
+                        # Create histogram data source
+                        hist_source = ColumnDataSource({
+                            'top': hist,
+                            'left': edges[:-1],
+                            'right': edges[1:],
+                            'condition': [condition] * len(hist)
+                        })
+                        
+                        # Plot histogram as rectangles
+                        color = palette[i]
+                        
+                        # Create quadrant renderer for the histogram
+                        renderer = ringratio_plot.quad(
+                            top='top',
+                            bottom=0,
+                            left='left',
+                            right='right',
+                            source=hist_source,
+                            line_color="white",
+                            fill_color=color,
+                            fill_alpha=0.7,
+                            legend_label=condition,
+                            name=f"hist_{condition}"
+                        )
+                        
+                        # Store histogram renderer info
+                        hist_renderers[condition] = {
+                            'renderer': renderer,
+                            'source': hist_source,
+                            'original_data': ColumnDataSource(data=valid_data),
+                            'color': color
+                        }
+            
+            # Configure legend for histogram plot
+            ringratio_plot.legend.click_policy = "hide"
+            ringratio_plot.legend.location = "top_right"
         
         # Create widgets
         
@@ -737,6 +895,30 @@ class SQLPlotter:
             width=400
         )
         
+        # Create RingRatio slider if data available
+        ringratio_slider = None
+        if has_ringratio:
+            ringratio_slider = RangeSlider(
+                title="Ring Ratio Range",
+                start=min_ringratio, 
+                end=max_ringratio,
+                value=(min_ringratio, max_ringratio),
+                step=(max_ringratio - min_ringratio) / 100,
+                width=400
+            )
+        
+        # Histogram settings
+        bins_slider = None
+        if has_ringratio:
+            bins_slider = Slider(
+                title="Histogram Bins",
+                start=5, 
+                end=50,
+                value=30,
+                step=1,
+                width=400
+            )
+        
         opacity_slider = Slider(
             title="Point Opacity",
             start=0.1, 
@@ -772,9 +954,9 @@ class SQLPlotter:
         let total_visible = 0;
         const stats = {};
         
-        // Update each renderer
-        for (const condition in renderers) {
-            const renderer_info = renderers[condition];
+        // Update each scatter renderer
+        for (const condition in scatter_renderers) {
+            const renderer_info = scatter_renderers[condition];
             const renderer = renderer_info.renderer;
             const source = renderer_info.source;
             const original_data = renderer_info.original_data.data;
@@ -788,6 +970,7 @@ class SQLPlotter:
                 const filtered_deform = [];
                 const filtered_density = [];
                 const filtered_condition = [];
+                const filtered_ringratio = [];
                 
                 for (let i = 0; i < original_data.area.length; i++) {
                     if (
@@ -796,22 +979,38 @@ class SQLPlotter:
                         original_data.deformability[i] >= deform_slider.value[0] &&
                         original_data.deformability[i] <= deform_slider.value[1] &&
                         original_data.density[i] >= density_slider.value[0] &&
-                        original_data.density[i] <= density_slider.value[1]
+                        original_data.density[i] <= density_slider.value[1] &&
+                        (!has_ringratio || 
+                         (typeof original_data.ringratio[i] === 'number' &&
+                          !isNaN(original_data.ringratio[i]) &&
+                          original_data.ringratio[i] > 0 &&
+                          original_data.ringratio[i] >= ringratio_slider.value[0] &&
+                          original_data.ringratio[i] <= ringratio_slider.value[1]))
                     ) {
                         filtered_area.push(original_data.area[i]);
                         filtered_deform.push(original_data.deformability[i]);
                         filtered_density.push(original_data.density[i]);
                         filtered_condition.push(original_data.condition[i]);
+                        
+                        if (has_ringratio && 'ringratio' in original_data) {
+                            filtered_ringratio.push(original_data.ringratio[i]);
+                        }
                     }
                 }
                 
                 // Update renderer source
-                source.data = {
+                const new_data = {
                     'area': filtered_area,
                     'deformability': filtered_deform,
                     'density': filtered_density,
                     'condition': filtered_condition
                 };
+                
+                if (has_ringratio && filtered_ringratio.length > 0) {
+                    new_data['ringratio'] = filtered_ringratio;
+                }
+                
+                source.data = new_data;
                 
                 // Update appearance
                 renderer.glyph.fill_alpha = opacity_slider.value;
@@ -828,6 +1027,93 @@ class SQLPlotter:
                     visible: 0, 
                     total: original_data.area.length 
                 };
+            }
+        }
+        
+        // Update histograms if they exist
+        if (has_ringratio) {
+            // Global settings for all histograms
+            const bins = bins_slider.value;
+            const min_ringratio = ringratio_slider.value[0];
+            const max_ringratio = ringratio_slider.value[1];
+            
+            // Process each histogram
+            for (const condition in hist_renderers) {
+                const hist_info = hist_renderers[condition];
+                const hist_renderer = hist_info.renderer;
+                const hist_source = hist_info.source;
+                const original_data = hist_info.original_data.data;
+                
+                // Set visibility based on condition selection
+                hist_renderer.visible = selected_conditions.includes(condition);
+                
+                if (hist_renderer.visible) {
+                    // Filter data based on filters
+                    const filtered_ringratio = [];
+                    
+                    if ('ringratio' in original_data) {
+                        for (let i = 0; i < original_data.ringratio.length; i++) {
+                            // Only include valid Ring Ratio values (positive numbers)
+                            if (
+                                typeof original_data.ringratio[i] === 'number' &&
+                                !isNaN(original_data.ringratio[i]) &&
+                                original_data.ringratio[i] > 0 &&
+                                original_data.area[i] >= area_slider.value[0] &&
+                                original_data.area[i] <= area_slider.value[1] &&
+                                original_data.deformability[i] >= deform_slider.value[0] &&
+                                original_data.deformability[i] <= deform_slider.value[1] &&
+                                original_data.density[i] >= density_slider.value[0] &&
+                                original_data.density[i] <= density_slider.value[1] &&
+                                original_data.ringratio[i] >= min_ringratio &&
+                                original_data.ringratio[i] <= max_ringratio
+                            ) {
+                                filtered_ringratio.push(original_data.ringratio[i]);
+                            }
+                        }
+                    }
+                    
+                    // Create histogram data
+                    if (filtered_ringratio.length > 0) {
+                        // Create bins
+                        const bin_edges = [];
+                        const bin_width = (max_ringratio - min_ringratio) / bins;
+                        
+                        for (let i = 0; i <= bins; i++) {
+                            bin_edges.push(min_ringratio + i * bin_width);
+                        }
+                        
+                        // Initialize bin counts
+                        const bin_counts = Array(bins).fill(0);
+                        
+                        // Count values in each bin
+                        for (let i = 0; i < filtered_ringratio.length; i++) {
+                            const value = filtered_ringratio[i];
+                            // Handle edge case for max value
+                            if (value === max_ringratio) {
+                                bin_counts[bins - 1]++;
+                            } else {
+                                const bin_index = Math.floor((value - min_ringratio) / bin_width);
+                                if (bin_index >= 0 && bin_index < bins) {
+                                    bin_counts[bin_index]++;
+                                }
+                            }
+                        }
+                        
+                        // Create histogram data
+                        const hist_data = {
+                            'top': bin_counts,
+                            'left': bin_edges.slice(0, -1),
+                            'right': bin_edges.slice(1),
+                            'condition': Array(bins).fill(condition)
+                        };
+                        
+                        // Update source
+                        hist_source.data = hist_data;
+                    }
+                    
+                    // Update appearance
+                    hist_renderer.glyph.fill_alpha = opacity_slider.value;
+                }
             }
         }
         
@@ -855,8 +1141,14 @@ class SQLPlotter:
             'opacity_slider': opacity_slider,
             'point_size_slider': point_size_slider,
             'stats_div': stats_div,
-            'renderers': renderers
+            'scatter_renderers': scatter_renderers,
+            'has_ringratio': has_ringratio
         }
+        
+        if has_ringratio:
+            js_args['ringratio_slider'] = ringratio_slider
+            js_args['hist_renderers'] = hist_renderers
+            js_args['bins_slider'] = bins_slider
         
         # Create JS callback
         js_callback = CustomJS(args=js_args, code=js_code)
@@ -869,44 +1161,104 @@ class SQLPlotter:
         opacity_slider.js_on_change('value', js_callback)
         point_size_slider.js_on_change('value', js_callback)
         
+        if has_ringratio:
+            ringratio_slider.js_on_change('value', js_callback)
+            bins_slider.js_on_change('value', js_callback)
+        
         # Initialize the statistics display
         initial_stats_html = "<h3>Statistics</h3>"
-        for condition, render_info in renderers.items():
+        for condition, render_info in scatter_renderers.items():
             count = len(render_info['original_data'].data['area'])
             initial_stats_html += f"<p><b>{condition}</b>: {count} cells visible out of {count} total (100.0%)</p>"
         
-        total_count = sum(len(render_info['original_data'].data['area']) for render_info in renderers.values())
+        total_count = sum(len(render_info['original_data'].data['area']) for render_info in scatter_renderers.values())
         initial_stats_html += f"<p><b>Total visible</b>: {total_count} cells</p>"
         stats_div.text = initial_stats_html
         
-        # Create layout
+        # Create controls layout
+        filters_controls = column(
+            Div(text="<h3>Filter Data:</h3>"),
+            area_slider,
+            deform_slider,
+            density_slider
+        )
+        
+        if has_ringratio:
+            filters_controls.children.append(ringratio_slider)
+        
+        appearance_controls = column(
+            Div(text="<h3>Appearance:</h3>"),
+            opacity_slider,
+            point_size_slider
+        )
+        
+        if has_ringratio:
+            appearance_controls.children.append(bins_slider)
+        
         controls = column(
             Div(text="<h2>Cell Data Visualization</h2>"),
             Div(text="<h3>Select Conditions:</h3>"),
             condition_select,
-            Div(text="<h3>Filter Data:</h3>"),
-            area_slider,
-            deform_slider,
-            density_slider,
-            Div(text="<h3>Appearance:</h3>"),
-            opacity_slider,
-            point_size_slider,
+            filters_controls,
+            appearance_controls,
             stats_div
         )
         
-        # Create final layout
-        layout_obj = layout([[controls, p]])
+        # Create tabs for scatter plot and histogram
+        if has_ringratio and ringratio_plot:
+            # Fix the Panel constructor - title is not a valid attribute according to the error
+            # Need to check Bokeh version and use the appropriate method
+            try:
+                # First, try importing with newer API
+                from bokeh.models import TabPanel
+                
+                tabs = Tabs(tabs=[
+                    TabPanel(child=scatter_plot, title="Scatter Plot"),
+                    TabPanel(child=ringratio_plot, title="Ring Ratio Histogram")
+                ])
+                print("Using TabPanel for newer Bokeh versions")
+            except ImportError:
+                # Fallback method for older Bokeh versions
+                print("TabPanel not found, trying alternative Bokeh Panel approach")
+                try:
+                    # Try the older Panel approach
+                    tabs = Tabs(tabs=[
+                        Panel(child=scatter_plot, name="scatter_plot"),
+                        Panel(child=ringratio_plot, name="histogram")
+                    ])
+                    # Set titles manually if supported
+                    try:
+                        tabs.tabs[0].title = "Scatter Plot"
+                        tabs.tabs[1].title = "Ring Ratio Histogram"
+                    except:
+                        print("Could not set tab titles, using plain tabs")
+                except Exception as e:
+                    print(f"Error creating tabs: {e}")
+                    # Last resort: just use the scatter plot
+                    print("Falling back to scatter plot only due to tab creation error")
+                    final_layout = layout([[controls, scatter_plot]])
+                    if has_ringratio and ringratio_plot:
+                        # Still add the histogram below as another panel
+                        final_layout = layout([
+                            [controls, scatter_plot],
+                            [Div(text="<h2>Ring Ratio Histogram</h2>", width=200), ringratio_plot]
+                        ])
+                    return final_layout
+            
+            final_layout = layout([[controls, tabs]])
+        else:
+            final_layout = layout([[controls, scatter_plot]])
         
         # Handle output
         if output_path:
             output_file(output_path)
-            save(layout_obj)
+            save(final_layout)
             print(f"Plot saved to {output_path}")
         
         if show_plot:
-            show(layout_obj)
+            show(final_layout)
         
-        return layout_obj
+        return final_layout
     
     def close(self):
         """Close database connection"""
