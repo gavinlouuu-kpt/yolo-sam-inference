@@ -24,37 +24,55 @@ add button to update kde after adjusting area, deformability filtering with webu
 '''
 # Try to import GPU libraries
 try:
-    import cupy as cp
-    import cupyx.scipy.stats as cupyx_stats
-    HAS_GPU = True
-    print("CUDA GPU acceleration is available and will be used")
+    import torch
+    from torch.distributions import Normal
+    HAS_GPU = torch.cuda.is_available()
+    print(f"PyTorch {'with CUDA GPU acceleration' if HAS_GPU else 'CPU only'} will be used for KDE")
 except ImportError:
     HAS_GPU = False
-    print("CUDA GPU acceleration not available, using CPU")
+    print("PyTorch not available, using CPU for KDE calculations")
 
 class GPUAcceleratedKDE:
-    """KDE implementation that leverages GPU acceleration if available"""
+    """KDE implementation that leverages PyTorch GPU acceleration if available"""
     
-    def __init__(self, data_points):
+    def __init__(self, data_points, bandwidth=None):
         """
         Initialize KDE with data points
         
         Args:
             data_points: numpy array of shape (n_dimensions, n_points)
+            bandwidth: bandwidth for kernel, or None to use Scott's rule
         """
-        self.use_gpu = HAS_GPU and data_points.shape[1] > 1000  # Only use GPU for larger datasets
+        self.data_np = data_points
+        self.n_dims, self.n_points = data_points.shape
         
-        if self.use_gpu:
-            # Transfer data to GPU
-            self.data_gpu = cp.asarray(data_points)
-            try:
-                self.kde = cupyx_stats.gaussian_kde(self.data_gpu)
-                print(f"Using GPU for KDE calculation on {data_points.shape[1]} points")
-            except Exception as e:
-                print(f"GPU KDE initialization failed: {e}, falling back to CPU")
-                self.use_gpu = False
+        # Determine if we should use GPU (only for larger datasets)
+        self.use_gpu = HAS_GPU and data_points.shape[1] > 1000
+        self.device = torch.device('cuda' if self.use_gpu else 'cpu')
         
-        if not self.use_gpu:
+        try:
+            # Convert to torch tensor
+            self.data = torch.tensor(data_points, dtype=torch.float32, device=self.device)
+            
+            # Calculate bandwidth using Scott's rule if not provided
+            if bandwidth is None:
+                # Scott's rule: n**(-1/(d+4)) where n is number of data points and d is dimensions
+                self.bandwidth = data_points.std(axis=1) * (self.n_points ** (-1.0 / (self.n_dims + 4)))
+            else:
+                self.bandwidth = bandwidth if isinstance(bandwidth, np.ndarray) else np.array([bandwidth] * self.n_dims)
+                
+            # Convert bandwidth to tensor
+            self.bandwidth_tensor = torch.tensor(self.bandwidth, dtype=torch.float32, device=self.device)
+            
+            if self.use_gpu:
+                print(f"Using PyTorch GPU for KDE calculation on {self.n_points} points")
+            else:
+                print(f"Using PyTorch CPU for KDE calculation on {self.n_points} points")
+                
+        except Exception as e:
+            print(f"PyTorch KDE initialization failed: {e}, falling back to CPU")
+            self.use_gpu = False
+            # Initialize scipy's KDE as fallback
             self.kde = gaussian_kde(data_points)
     
     def evaluate(self, points):
@@ -62,22 +80,60 @@ class GPUAcceleratedKDE:
         Evaluate the KDE at the given points
         
         Args:
-            points: points at which to evaluate the KDE
+            points: points at which to evaluate the KDE, shape (n_dims, n_eval_points)
         
         Returns:
             Density values at the given points
         """
-        if self.use_gpu:
+        if not hasattr(self, 'kde'):  # If PyTorch initialization succeeded
             try:
-                # Transfer points to GPU, evaluate KDE, and transfer results back to CPU
-                points_gpu = cp.asarray(points)
-                result_gpu = self.kde(points_gpu)
-                return cp.asnumpy(result_gpu)
+                # Convert evaluation points to tensor
+                points_tensor = torch.tensor(points, dtype=torch.float32, device=self.device)
+                n_eval_points = points_tensor.shape[1]
+                
+                # Reshape tensors for broadcasting
+                # data: (n_dims, n_points, 1)
+                # points: (n_dims, 1, n_eval_points)
+                # bandwidth: (n_dims, 1, 1)
+                data_expanded = self.data.unsqueeze(2)
+                points_expanded = points_tensor.unsqueeze(1)
+                bandwidth_expanded = self.bandwidth_tensor.unsqueeze(1).unsqueeze(2)
+                
+                # Calculate squared distances: [(x_i - x'_j)/h_i]^2 for all dimensions
+                # Shape: (n_dims, n_points, n_eval_points)
+                squared_diffs = ((data_expanded - points_expanded) / bandwidth_expanded) ** 2
+                
+                # Sum across dimensions
+                # Shape: (n_points, n_eval_points)
+                mahalanobis_dist = squared_diffs.sum(dim=0)
+                
+                # Apply Gaussian kernel: exp(-0.5 * dist^2)
+                # Shape: (n_points, n_eval_points)
+                kernel_values = torch.exp(-0.5 * mahalanobis_dist)
+                
+                # Normalize by bandwidth and constant factors
+                # (2π)^(-d/2) * h1^-1 * h2^-1 * ... * hd^-1
+                norm_factor = (2 * torch.tensor(np.pi, device=self.device)) ** (-0.5 * self.n_dims)
+                norm_factor = norm_factor * torch.prod(self.bandwidth_tensor.reciprocal())
+                
+                # Apply normalization to kernel values
+                kernel_values = kernel_values * norm_factor
+                
+                # Sum contributions from all data points and normalize
+                # Shape: (n_eval_points,)
+                density = kernel_values.sum(dim=0) / self.n_points
+                
+                # Return as numpy array
+                return density.cpu().numpy()
+                
             except Exception as e:
-                print(f"GPU KDE evaluation failed: {e}, falling back to CPU")
-                # Fall back to CPU
+                print(f"PyTorch KDE evaluation failed: {e}, falling back to CPU")
+                # If PyTorch evaluation fails, initialize scipy KDE and use it
+                if not hasattr(self, 'kde'):
+                    self.kde = gaussian_kde(self.data_np)
                 return self.kde(points)
         else:
+            # Use scipy KDE if PyTorch initialization failed
             return self.kde(points)
 
 class SQLPlotter:
