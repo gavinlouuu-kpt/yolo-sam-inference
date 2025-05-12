@@ -183,7 +183,8 @@ class SQLPlotter:
             deformability REAL,
             area_ratio REAL,
             density REAL DEFAULT 0,
-            ringratio REAL
+            ringratio REAL,
+            timestamp_us INTEGER
         )
         ''')
         
@@ -232,13 +233,24 @@ class SQLPlotter:
                     except (ValueError, TypeError):
                         ringratio = 0.0
                     
-                    values.append((condition, area, deformability, area_ratio, ringratio))
+                    # Handle timestamp if present
+                    timestamp_us = None
+                    timestamp_col = next((col for col in row.index if col.lower() == 'timestamp_us'), None)
+                    if timestamp_col and timestamp_col in row:
+                        try:
+                            timestamp_us = int(row[timestamp_col])
+                            if np.isnan(timestamp_us) or np.isinf(timestamp_us):
+                                timestamp_us = None
+                        except (ValueError, TypeError):
+                            timestamp_us = None
+                    
+                    values.append((condition, area, deformability, area_ratio, ringratio, timestamp_us))
                 except (ValueError, KeyError) as e:
                     print(f"Skipping row due to error: {e}")
             
             # Insert batch
             self.conn.executemany(
-                'INSERT INTO cell_data (condition, area, deformability, area_ratio, ringratio) VALUES (?, ?, ?, ?, ?)',
+                'INSERT INTO cell_data (condition, area, deformability, area_ratio, ringratio, timestamp_us) VALUES (?, ?, ?, ?, ?, ?)',
                 values
             )
             self.conn.commit()  # Commit after each batch
@@ -519,6 +531,42 @@ class SQLPlotter:
             print(f"DataFrame columns: {all_data.columns.tolist()}")
             print(f"First row: {all_data.iloc[0].to_dict() if len(all_data) > 0 else 'No data'}")
             
+            # Process timestamp if present
+            has_timestamp = 'timestamp_us' in all_data.columns.str.lower()
+            timestamp_column = None
+            
+            if has_timestamp:
+                # Find the actual column name (case-insensitive)
+                timestamp_candidates = [col for col in all_data.columns if col.lower() == 'timestamp_us']
+                if timestamp_candidates:
+                    timestamp_column = timestamp_candidates[0]
+                    print(f"Found timestamp column: {timestamp_column}")
+                    
+                    # Convert to relative timestamps per condition
+                    all_data['rel_timestamp'] = 0.0  # Initialize with zeros
+                    
+                    # Process each condition separately to create relative timestamps
+                    for condition in conditions:
+                        condition_mask = all_data['condition'] == condition
+                        if condition_mask.any():
+                            condition_data = all_data[condition_mask]
+                            
+                            # Find minimum timestamp for this condition
+                            try:
+                                min_timestamp = condition_data[timestamp_column].min()
+                                
+                                # Calculate relative timestamps in seconds
+                                all_data.loc[condition_mask, 'rel_timestamp'] = \
+                                    (all_data.loc[condition_mask, timestamp_column] - min_timestamp) / 1e6  # Convert microseconds to seconds
+                                    
+                                print(f"Processed relative timestamps for condition '{condition}': " +
+                                      f"min={min_timestamp}, " +
+                                      f"max_relative={all_data.loc[condition_mask, 'rel_timestamp'].max():.2f} seconds")
+                            except Exception as e:
+                                print(f"Error processing timestamps for condition '{condition}': {e}")
+                                # If timestamps can't be processed, leave as zeros
+                                pass
+            
             # Ensure required columns exist
             required_columns = ['condition', 'area', 'deformability', 'density']
             missing_columns = [col for col in required_columns if col not in all_data.columns]
@@ -676,6 +724,16 @@ class SQLPlotter:
         min_deformability = all_data['deformability'].min()
         max_deformability = all_data['deformability'].max()
         
+        # Check for timestamp column
+        has_timestamp = 'rel_timestamp' in all_data.columns
+        min_timestamp = 0
+        max_timestamp = 0
+        
+        if has_timestamp:
+            min_timestamp = 0  # Relative timestamp always starts at 0
+            max_timestamp = all_data['rel_timestamp'].max()
+            print(f"Found relative timestamp data: range 0 to {max_timestamp:.2f} seconds")
+        
         # Check for RingRatio column
         has_ringratio = 'ringratio' in all_data.columns
         
@@ -717,6 +775,9 @@ class SQLPlotter:
         
         if has_ringratio:
             hover.tooltips.append(("Ring Ratio", "@ringratio{0.0000}"))
+            
+        if has_timestamp:
+            hover.tooltips.append(("Time", "@rel_timestamp{0.00} seconds"))
         
         # Create figure
         scatter_plot = figure(
@@ -895,6 +956,18 @@ class SQLPlotter:
             width=400
         )
         
+        # Timestamp slider if data available
+        timestamp_slider = None
+        if has_timestamp:
+            timestamp_slider = RangeSlider(
+                title="Time Range (seconds)",
+                start=min_timestamp, 
+                end=max_timestamp,
+                value=(min_timestamp, max_timestamp),
+                step=(max_timestamp - min_timestamp) / 100 if max_timestamp > min_timestamp else 0.1,
+                width=400
+            )
+        
         # Create RingRatio slider if data available
         ringratio_slider = None
         if has_ringratio:
@@ -971,6 +1044,7 @@ class SQLPlotter:
                 const filtered_density = [];
                 const filtered_condition = [];
                 const filtered_ringratio = [];
+                const filtered_timestamp = [];
                 
                 for (let i = 0; i < original_data.area.length; i++) {
                     if (
@@ -985,7 +1059,12 @@ class SQLPlotter:
                           !isNaN(original_data.ringratio[i]) &&
                           original_data.ringratio[i] > 0 &&
                           original_data.ringratio[i] >= ringratio_slider.value[0] &&
-                          original_data.ringratio[i] <= ringratio_slider.value[1]))
+                          original_data.ringratio[i] <= ringratio_slider.value[1])) &&
+                        (!has_timestamp ||
+                         (typeof original_data.rel_timestamp[i] === 'number' &&
+                          !isNaN(original_data.rel_timestamp[i]) &&
+                          original_data.rel_timestamp[i] >= timestamp_slider.value[0] &&
+                          original_data.rel_timestamp[i] <= timestamp_slider.value[1]))
                     ) {
                         filtered_area.push(original_data.area[i]);
                         filtered_deform.push(original_data.deformability[i]);
@@ -994,6 +1073,10 @@ class SQLPlotter:
                         
                         if (has_ringratio && 'ringratio' in original_data) {
                             filtered_ringratio.push(original_data.ringratio[i]);
+                        }
+                        
+                        if (has_timestamp && 'rel_timestamp' in original_data) {
+                            filtered_timestamp.push(original_data.rel_timestamp[i]);
                         }
                     }
                 }
@@ -1008,6 +1091,10 @@ class SQLPlotter:
                 
                 if (has_ringratio && filtered_ringratio.length > 0) {
                     new_data['ringratio'] = filtered_ringratio;
+                }
+                
+                if (has_timestamp && filtered_timestamp.length > 0) {
+                    new_data['rel_timestamp'] = filtered_timestamp;
                 }
                 
                 source.data = new_data;
@@ -1065,7 +1152,12 @@ class SQLPlotter:
                                 original_data.density[i] >= density_slider.value[0] &&
                                 original_data.density[i] <= density_slider.value[1] &&
                                 original_data.ringratio[i] >= min_ringratio &&
-                                original_data.ringratio[i] <= max_ringratio
+                                original_data.ringratio[i] <= max_ringratio &&
+                                (!has_timestamp ||
+                                 (typeof original_data.rel_timestamp[i] === 'number' &&
+                                  !isNaN(original_data.rel_timestamp[i]) &&
+                                  original_data.rel_timestamp[i] >= timestamp_slider.value[0] &&
+                                  original_data.rel_timestamp[i] <= timestamp_slider.value[1]))
                             ) {
                                 filtered_ringratio.push(original_data.ringratio[i]);
                             }
@@ -1142,13 +1234,17 @@ class SQLPlotter:
             'point_size_slider': point_size_slider,
             'stats_div': stats_div,
             'scatter_renderers': scatter_renderers,
-            'has_ringratio': has_ringratio
+            'has_ringratio': has_ringratio,
+            'has_timestamp': has_timestamp
         }
         
         if has_ringratio:
             js_args['ringratio_slider'] = ringratio_slider
             js_args['hist_renderers'] = hist_renderers
             js_args['bins_slider'] = bins_slider
+            
+        if has_timestamp:
+            js_args['timestamp_slider'] = timestamp_slider
         
         # Create JS callback
         js_callback = CustomJS(args=js_args, code=js_code)
@@ -1164,6 +1260,9 @@ class SQLPlotter:
         if has_ringratio:
             ringratio_slider.js_on_change('value', js_callback)
             bins_slider.js_on_change('value', js_callback)
+            
+        if has_timestamp:
+            timestamp_slider.js_on_change('value', js_callback)
         
         # Initialize the statistics display
         initial_stats_html = "<h3>Statistics</h3>"
@@ -1183,6 +1282,9 @@ class SQLPlotter:
             density_slider
         )
         
+        if has_timestamp:
+            filters_controls.children.append(timestamp_slider)
+            
         if has_ringratio:
             filters_controls.children.append(ringratio_slider)
         
