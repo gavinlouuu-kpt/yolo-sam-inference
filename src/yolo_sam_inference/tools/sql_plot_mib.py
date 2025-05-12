@@ -18,6 +18,7 @@ import time
 import argparse
 from pathlib import Path
 from tqdm import tqdm
+import glob
 '''
 add button to update kde after adjusting area, deformability filtering with webui
 '''
@@ -86,7 +87,7 @@ class SQLPlotter:
     and adds interactive features.
     """
     
-    def __init__(self, data_path=None, db_path=None, use_gpu=None):
+    def __init__(self, data_path=None, db_path=None, use_gpu=None, data_dir=None):
         """
         Initialize the plotter with data or database path.
         
@@ -94,8 +95,11 @@ class SQLPlotter:
             data_path (str): Path to CSV/Excel file with cell data
             db_path (str): Path to SQLite database (if data already imported)
             use_gpu (bool): Force GPU usage on or off (None = auto-detect)
+            data_dir (str): Directory containing multiple CSV files to combine
         """
-        if data_path and not db_path:
+        if data_dir and not db_path:
+            self.db_path = os.path.join(data_dir, 'combined_cell_data.db')
+        elif data_path and not db_path:
             data_dir = str(Path(data_path).parent)
             self.db_path = os.path.join(data_dir, 'cell_data.db')
         else:
@@ -111,9 +115,200 @@ class SQLPlotter:
         # Initialize database
         if data_path:
             self._initialize_db(data_path)
+        elif data_dir:
+            self._initialize_from_directory(data_dir)
         else:
             self._connect_db()
             self._load_conditions()
+    
+    def _initialize_from_directory(self, data_dir):
+        """Create and populate SQLite database from multiple CSV/Excel files in a directory"""
+        print(f"Initializing database from directory: {data_dir}")
+        start_time = time.time()
+        
+        # Find all CSV and Excel files in the directory
+        csv_files = glob.glob(os.path.join(data_dir, "*.csv"))
+        excel_files = glob.glob(os.path.join(data_dir, "*.xlsx")) + glob.glob(os.path.join(data_dir, "*.xls"))
+        all_files = csv_files + excel_files
+        
+        if not all_files:
+            raise ValueError(f"No CSV or Excel files found in directory: {data_dir}")
+        
+        print(f"Found {len(all_files)} data files: {', '.join(os.path.basename(f) for f in all_files)}")
+        
+        # Connect to database
+        self._connect_db()
+        
+        # Create tables
+        self.conn.execute('''
+        CREATE TABLE IF NOT EXISTS cell_data (
+            id INTEGER PRIMARY KEY,
+            condition TEXT,
+            area REAL,
+            deformability REAL,
+            area_ratio REAL,
+            density REAL DEFAULT 0,
+            ringratio REAL,
+            timestamp_us INTEGER,
+            source_file TEXT
+        )
+        ''')
+        
+        # Create index for faster querying
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_condition ON cell_data(condition)')
+        
+        # Process each file
+        combined_data = pd.DataFrame()
+        
+        for file_path in tqdm(all_files, desc="Processing files"):
+            try:
+                print(f"Processing file: {os.path.basename(file_path)}")
+                
+                # Read the data file
+                if file_path.endswith('.csv'):
+                    data = pd.read_csv(file_path)
+                elif file_path.endswith(('.xlsx', '.xls')):
+                    data = pd.read_excel(file_path)
+                
+                # Convert column names to lowercase
+                data.columns = data.columns.str.lower()
+                
+                # Check for required columns
+                required_columns = ['area', 'deformability']
+                missing_columns = [col for col in required_columns if col not in data.columns]
+                if missing_columns:
+                    print(f"Warning: File {os.path.basename(file_path)} is missing required columns: {', '.join(missing_columns)}")
+                    print("Skipping this file.")
+                    continue
+                
+                # Check for condition column, create if missing using filename
+                if 'condition' not in data.columns:
+                    file_name = os.path.splitext(os.path.basename(file_path))[0]
+                    print(f"Warning: 'condition' column not found in {os.path.basename(file_path)}. Using filename '{file_name}' as condition.")
+                    data['condition'] = file_name
+                
+                # Add source file column
+                data['source_file'] = os.path.basename(file_path)
+                
+                # Clean data: replace Excel error values with NaN
+                excel_errors = ['#NAME?', '#DIV/0!', '#N/A', '#NULL!', '#NUM!', '#REF!', '#VALUE!', '#ERROR!']
+                
+                # Function to clean values
+                def clean_value(val):
+                    if isinstance(val, str) and any(err in val for err in excel_errors):
+                        return np.nan
+                    return val
+                
+                # Apply to numeric columns
+                numeric_columns = ['area', 'deformability', 'area_ratio', 'ringratio']
+                for col in numeric_columns:
+                    if col in data.columns:
+                        data[col] = data[col].apply(clean_value)
+                
+                # Now drop rows with NaN in required columns
+                original_rows = len(data)
+                data = data.dropna(subset=['area', 'deformability'])
+                
+                # Remove infinite values
+                data = data[(data['area'] != float('inf')) & (data['area'] != float('-inf'))]
+                data = data[(data['deformability'] != float('inf')) & (data['deformability'] != float('-inf'))]
+                
+                # Report data cleaning results
+                cleaned_rows = len(data)
+                if original_rows != cleaned_rows:
+                    print(f"Removed {original_rows - cleaned_rows} rows with invalid data ({(original_rows - cleaned_rows)/original_rows*100:.1f}%)")
+                
+                # Add to combined data
+                combined_data = pd.concat([combined_data, data], ignore_index=True)
+                
+            except Exception as e:
+                print(f"Error processing file {os.path.basename(file_path)}: {e}")
+                print("Skipping this file and continuing...")
+        
+        if combined_data.empty:
+            raise ValueError("No valid data found in any of the files")
+        
+        print(f"Combined data has {len(combined_data)} rows from {len(all_files)} files")
+        
+        # Save combined CSV for reference
+        combined_csv_path = os.path.join(data_dir, 'combined_data.csv')
+        combined_data.to_csv(combined_csv_path, index=False)
+        print(f"Saved combined data to: {combined_csv_path}")
+        
+        # Insert data in batches for better performance
+        print("Inserting data into database...")
+        batch_size = 5000
+        for i in tqdm(range(0, len(combined_data), batch_size), desc="Inserting batches"):
+            batch = combined_data.iloc[i:i+batch_size]
+            
+            # Prepare data for insertion
+            values = []
+            for _, row in batch.iterrows():
+                try:
+                    condition = row.get('condition', 'Unknown')
+                    
+                    # Extra validation to prevent issues with float conversion
+                    try:
+                        area = float(row['area'])
+                        if np.isnan(area) or np.isinf(area):
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                        
+                    try:
+                        deformability = float(row['deformability'])
+                        if np.isnan(deformability) or np.isinf(deformability):
+                            continue
+                    except (ValueError, TypeError):
+                        continue
+                    
+                    # Handle optional columns gracefully
+                    try:
+                        area_ratio = float(row.get('area_ratio', 1.0)) if 'area_ratio' in row else 1.0
+                        if np.isnan(area_ratio) or np.isinf(area_ratio):
+                            area_ratio = 1.0
+                    except (ValueError, TypeError):
+                        area_ratio = 1.0
+                        
+                    try:
+                        ringratio = float(row.get('ringratio', 0.0)) if 'ringratio' in row else 0.0
+                        if np.isnan(ringratio) or np.isinf(ringratio):
+                            ringratio = 0.0
+                    except (ValueError, TypeError):
+                        ringratio = 0.0
+                    
+                    # Handle timestamp if present
+                    timestamp_us = None
+                    timestamp_col = next((col for col in row.index if col.lower() == 'timestamp_us'), None)
+                    if timestamp_col and timestamp_col in row:
+                        try:
+                            timestamp_us = int(row[timestamp_col])
+                            if np.isnan(timestamp_us) or np.isinf(timestamp_us):
+                                timestamp_us = None
+                        except (ValueError, TypeError):
+                            timestamp_us = None
+                    
+                    # Get source file
+                    source_file = row.get('source_file', 'Unknown')
+                    
+                    values.append((condition, area, deformability, area_ratio, ringratio, timestamp_us, source_file))
+                except (ValueError, KeyError) as e:
+                    pass
+            
+            # Insert batch
+            self.conn.executemany(
+                'INSERT INTO cell_data (condition, area, deformability, area_ratio, ringratio, timestamp_us, source_file) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                values
+            )
+            self.conn.commit()
+        
+        print(f"Database initialization completed in {time.time() - start_time:.2f} seconds")
+        
+        # Load conditions
+        self._load_conditions()
+        
+        # Calculate and store density values
+        self._calculate_densities()
     
     def _initialize_db(self, data_path):
         """Create and populate SQLite database from CSV/Excel"""
@@ -1372,6 +1567,7 @@ def main():
     """Main function to run the script"""
     parser = argparse.ArgumentParser(description='Create interactive cell data plots')
     parser.add_argument('--data', type=str, help='Path to CSV or Excel data file')
+    parser.add_argument('--dir', type=str, help='Path to directory containing multiple CSV/Excel files to combine')
     parser.add_argument('--db', type=str, help='Path to SQLite database (if data already imported)')
     parser.add_argument('--output', type=str, help='Output HTML file path (defaults to same location as data file)')
     parser.add_argument('--no-show', action='store_true', help='Do not show plot in browser')
@@ -1381,15 +1577,19 @@ def main():
     args = parser.parse_args()
     
     # Validate arguments
-    if not args.data and not args.db:
-        print("Error: Either --data or --db argument is required")
+    if not args.data and not args.db and not args.dir:
+        print("Error: Either --data, --dir, or --db argument is required")
         parser.print_help()
         return
     
-    # Set default output path based on input data file
+    # Set default output path based on input
     if args.data and not args.output:
         data_path = Path(args.data)
         args.output = str(data_path.with_suffix('.html'))
+        print(f"Output path not specified. Using: {args.output}")
+    elif args.dir and not args.output:
+        dir_path = Path(args.dir)
+        args.output = str(dir_path / 'combined_plot.html')
         print(f"Output path not specified. Using: {args.output}")
     
     # Determine GPU usage
@@ -1401,7 +1601,10 @@ def main():
     
     # Create plotter
     try:
-        plotter = SQLPlotter(data_path=args.data, db_path=args.db, use_gpu=use_gpu)
+        if args.dir:
+            plotter = SQLPlotter(data_dir=args.dir, use_gpu=use_gpu)
+        else:
+            plotter = SQLPlotter(data_path=args.data, db_path=args.db, use_gpu=use_gpu)
         
         # Create and show static plot
         plotter.create_interactive_plot(
