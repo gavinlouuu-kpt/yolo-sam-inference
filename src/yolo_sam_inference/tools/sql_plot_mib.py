@@ -1051,6 +1051,8 @@ class SQLPlotter:
         scatter_renderers = {}
         palette = Turbo256[::max(1, 256 // len(data_by_condition))][:len(data_by_condition)]
         
+        N_CONTOUR_GRID = 30 # Resolution for the density grid for contours
+        
         for i, (condition, df) in enumerate(data_by_condition.items()):
             source = ColumnDataSource(data=df)
             color = palette[i]
@@ -1065,11 +1067,65 @@ class SQLPlotter:
                 legend_label=condition,
                 name=f"scatter_{condition}"
             )
+            
+            # Prepare density grid data for contours for this condition
+            density_map_data = None
+            if not df.empty and 'area' in df.columns and 'deformability' in df.columns and len(df) > 5:
+                try:
+                    x_min, x_max = df['area'].min(), df['area'].max()
+                    y_min, y_max = df['deformability'].min(), df['deformability'].max()
+                    
+                    if x_max > x_min and y_max > y_min: # Ensure valid range
+                        xx_coords = np.linspace(x_min, x_max, N_CONTOUR_GRID)
+                        yy_coords = np.linspace(y_min, y_max, N_CONTOUR_GRID)
+                        xx, yy = np.meshgrid(xx_coords, yy_coords)
+                        
+                        eval_points = np.vstack([xx.ravel(), yy.ravel()])
+                        
+                        # Use the condition's specific data points for its KDE
+                        condition_points = df[['area', 'deformability']].values.T
+                        
+                        if condition_points.shape[1] > 1: # Need at least 2 points for KDE std dev calc
+                            kde = GPUAcceleratedKDE(condition_points) # Use existing GPU KDE
+                            grid_densities_flat = kde.evaluate(eval_points)
+                            
+                            # Normalize these grid densities (0-1 for this specific grid)
+                            min_d = grid_densities_flat.min()
+                            max_d = grid_densities_flat.max()
+                            if max_d > min_d:
+                                scaled_grid_densities_flat = (grid_densities_flat - min_d) / (max_d - min_d)
+                            else:
+                                scaled_grid_densities_flat = np.zeros_like(grid_densities_flat) if max_d == min_d else grid_densities_flat
+                            
+                            grid_densities_2d = scaled_grid_densities_flat.reshape((N_CONTOUR_GRID, N_CONTOUR_GRID))
+                            
+                            density_map_data = {
+                                'X_coords': xx_coords.tolist(), # Store 1D arrays for X and Y axes
+                                'Y_coords': yy_coords.tolist(),
+                                'Z_grid': grid_densities_2d.tolist() # Store 2D Z values
+                            }
+                        else:
+                            print(f"Condition '{condition}' has insufficient points ({condition_points.shape[1]}) for KDE grid.")
+                    else:
+                        print(f"Condition '{condition}' has zero range for area or deformability, skipping contour grid.")
+                except Exception as e:
+                    print(f"Error generating density grid for condition '{condition}': {e}")
+
+            contour_source = ColumnDataSource(data=dict(xs=[], ys=[]))
+            contour_renderer = scatter_plot.multi_line(
+                xs='xs', ys='ys', source=contour_source, 
+                line_width=2, color=color, alpha=0.6 # Use same color as points
+            )
+            contour_renderer.visible = True # Initially visible, JS will manage based on data
+
             scatter_renderers[condition] = {
                 'renderer': renderer,
                 'source': source,
                 'original_data': ColumnDataSource(data=df),
-                'color': color
+                'color': color,
+                'density_map_data': density_map_data,
+                'contour_source': contour_source,
+                'contour_renderer': contour_renderer
             }
         
         # Configure legend
@@ -1243,12 +1299,126 @@ class SQLPlotter:
             width=400
         )
         
+        # Density Contour Slider
+        contour_level_slider = Slider(
+            title="Contour Density Level", 
+            start=0.0, 
+            end=1.0, 
+            value=0.5, 
+            step=0.05, 
+            width=400
+        )
+
+        contour_opacity_slider = Slider(
+            title="Contour Line Opacity",
+            start=0.1, 
+            end=1.0,
+            value=0.7, # Default to more visible
+            step=0.05,
+            width=400
+        )
+
+        contour_width_slider = Slider(
+            title="Contour Line Width",
+            start=1, 
+            end=5,
+            value=2, # Default line width
+            step=0.5,
+            width=400
+        )
         
         # Stats display
         stats_div = Div(text="", width=400)
         
         # Create JavaScript callback code
         js_code = """
+        // Marching Squares function to get contour line segments
+        // Z_grid: 2D array of density values
+        // X_coords: 1D array of x-coordinates for grid columns
+        // Y_coords: 1D array of y-coordinates for grid rows
+        // level: contour level
+        function getMarchingSquaresSegments(Z_grid, X_coords, Y_coords, level) {
+            const lines_xs = []; 
+            const lines_ys = []; 
+            
+            if (!Z_grid || Z_grid.length === 0 || Z_grid[0].length === 0) {
+                return {xs: [], ys: []};
+            }
+            if (!X_coords || X_coords.length === 0 || !Y_coords || Y_coords.length === 0) {
+                return {xs: [], ys: []};
+            }
+
+            const num_rows = Z_grid.length;
+            const num_cols = Z_grid[0].length;
+
+            function interpolate(val1, val2, coord1, coord2, target_level) {
+                if (Math.abs(val1 - val2) < 1e-9) return coord1; 
+                return coord1 + (coord2 - coord1) * (target_level - val1) / (val2 - val1);
+            }
+
+            for (let r = 0; r < num_rows - 1; r++) {
+                for (let c = 0; c < num_cols - 1; c++) {
+                    const x_p1 = X_coords[c];
+                    const x_p2 = X_coords[c+1];
+                    const y_p1 = Y_coords[r]; 
+                    const y_p2 = Y_coords[r+1];
+
+                    const values = [
+                        Z_grid[r][c],     // Top-left (v0)
+                        Z_grid[r][c+1],   // Top-right (v1)
+                        Z_grid[r+1][c+1], // Bottom-right (v2)
+                        Z_grid[r+1][c]    // Bottom-left (v3)
+                    ];
+
+                    let case_index = 0;
+                    if (values[0] > level) case_index |= 1;
+                    if (values[1] > level) case_index |= 2;
+                    if (values[2] > level) case_index |= 4;
+                    if (values[3] > level) case_index |= 8;
+                    
+                    const pt0_x = interpolate(values[0], values[1], x_p1, x_p2, level);
+                    const pt0 = [pt0_x, y_p1];
+                    const pt1_y = interpolate(values[1], values[2], y_p1, y_p2, level);
+                    const pt1 = [x_p2, pt1_y];
+                    const pt2_x = interpolate(values[3], values[2], x_p1, x_p2, level); // Note: v3, v2 for bottom edge x-interp
+                    const pt2 = [pt2_x, y_p2];
+                    const pt3_y = interpolate(values[0], values[3], y_p1, y_p2, level);
+                    const pt3 = [x_p1, pt3_y];
+
+                    const edge_points = [pt0, pt1, pt2, pt3];
+                    
+                    const line_definitions = [
+                        [],                            // 0
+                        [[3,0]],                       // 1
+                        [[0,1]],                       // 2
+                        [[3,1]],                       // 3
+                        [[1,2]],                       // 4
+                        [[3,0], [1,2]],                // 5
+                        [[0,2]],                       // 6
+                        [[3,2]],                       // 7
+                        [[2,3]],                       // 8
+                        [[2,0]],                       // 9
+                        [[0,1], [2,3]],                // 10
+                        [[2,1]],                       // 11
+                        [[1,3]],                       // 12
+                        [[1,0]],                       // 13
+                        [[0,3]],                       // 14
+                        []                             // 15
+                    ];
+
+                    const segments_for_cell = line_definitions[case_index];
+                    for (let i = 0; i < segments_for_cell.length; i++) {
+                        const point_indices = segments_for_cell[i];
+                        const start_point = edge_points[point_indices[0]];
+                        const end_point = edge_points[point_indices[1]];
+                        lines_xs.push([start_point[0], end_point[0]]);
+                        lines_ys.push([start_point[1], end_point[1]]);
+                    }
+                }
+            }
+            return {xs: lines_xs, ys: lines_ys};
+        }
+
         // Get selected conditions
         const selected_indices = condition_select.active;
         const selected_conditions = [];
@@ -1260,24 +1430,32 @@ class SQLPlotter:
         let total_visible = 0;
         const stats = {};
         
+        const current_contour_level = contour_level_slider.value;
+        const general_opacity = opacity_slider.value; // For points
+        const current_contour_opacity = contour_opacity_slider.value; // For contour lines
+        const current_contour_width = contour_width_slider.value; // For contour lines
+
         // Update each scatter renderer
         for (const condition in scatter_renderers) {
             const renderer_info = scatter_renderers[condition];
             const renderer = renderer_info.renderer;
             const source = renderer_info.source;
             const original_data = renderer_info.original_data.data;
+            const contour_source = renderer_info.contour_source;
+            const contour_renderer = renderer_info.contour_renderer;
+            const density_map_data = renderer_info.density_map_data;
             
             // Set visibility
             renderer.visible = selected_conditions.includes(condition);
             
             if (renderer.visible) {
-                // Apply filters
+                // Apply filters to points
                 const filtered_area = [];
                 const filtered_deform = [];
                 const filtered_density = [];
                 const filtered_condition = [];
-                const filtered_ringratio = [];
-                const filtered_timestamp = [];
+                const filtered_ringratio = []; // Ensure this is declared
+                const filtered_timestamp = []; // Ensure this is declared
                 
                 for (let i = 0; i < original_data.area.length; i++) {
                     if (
@@ -1287,13 +1465,13 @@ class SQLPlotter:
                         original_data.deformability[i] <= deform_slider.value[1] &&
                         original_data.density[i] >= density_slider.value[0] &&
                         original_data.density[i] <= density_slider.value[1] &&
-                        (!has_ringratio || 
+                        (!has_ringratio || !ringratio_slider || // Check if ringratio_slider exists
                          (typeof original_data.ringratio[i] === 'number' &&
                           !isNaN(original_data.ringratio[i]) &&
-                          original_data.ringratio[i] > 0 &&
+                          original_data.ringratio[i] > 0 && // Ensure positive for log or some calcs
                           original_data.ringratio[i] >= ringratio_slider.value[0] &&
                           original_data.ringratio[i] <= ringratio_slider.value[1])) &&
-                        (!has_timestamp ||
+                        (!has_timestamp || !timestamp_slider || // Check if timestamp_slider exists
                          (typeof original_data.rel_timestamp[i] === 'number' &&
                           !isNaN(original_data.rel_timestamp[i]) &&
                           original_data.rel_timestamp[i] >= timestamp_slider.value[0] &&
@@ -1304,17 +1482,16 @@ class SQLPlotter:
                         filtered_density.push(original_data.density[i]);
                         filtered_condition.push(original_data.condition[i]);
                         
-                        if (has_ringratio && 'ringratio' in original_data) {
+                        if (has_ringratio && original_data.ringratio && typeof original_data.ringratio[i] === 'number') {
                             filtered_ringratio.push(original_data.ringratio[i]);
                         }
                         
-                        if (has_timestamp && 'rel_timestamp' in original_data) {
+                        if (has_timestamp && original_data.rel_timestamp && typeof original_data.rel_timestamp[i] === 'number') {
                             filtered_timestamp.push(original_data.rel_timestamp[i]);
                         }
                     }
                 }
                 
-                // Update renderer source
                 const new_data = {
                     'area': filtered_area,
                     'deformability': filtered_deform,
@@ -1332,112 +1509,135 @@ class SQLPlotter:
                 
                 source.data = new_data;
                 
-                // Update appearance
-                renderer.glyph.fill_alpha = opacity_slider.value;
+                renderer.glyph.fill_alpha = general_opacity;
                 renderer.glyph.size = point_size_slider.value;
                 
-                // Store stats
                 stats[condition] = {
                     visible: filtered_area.length,
                     total: original_data.area.length
                 };
                 total_visible += filtered_area.length;
-            } else {
+
+                // Update contours for visible and filtered condition
+                if (density_map_data && contour_source && contour_renderer) {
+                    const contour_data = getMarchingSquaresSegments(
+                        density_map_data.Z_grid, 
+                        density_map_data.X_coords, 
+                        density_map_data.Y_coords, 
+                        current_contour_level
+                    );
+                    contour_source.data = contour_data;
+                    contour_renderer.glyph.line_alpha = current_contour_opacity; // Use dedicated opacity
+                    contour_renderer.glyph.line_width = current_contour_width; // Use dedicated width
+                    contour_renderer.visible = true;
+                } else if (contour_source && contour_renderer) { // Ensure cleanup if no map data
+                    contour_source.data = {xs:[], ys:[]};
+                    contour_renderer.visible = false;
+                }
+
+            } else { // if renderer is not visible
                 stats[condition] = { 
                     visible: 0, 
                     total: original_data.area.length 
                 };
+                // Hide contours if condition scatter is not visible
+                if (contour_source && contour_renderer) {
+                    contour_source.data = {xs:[], ys:[]};
+                    contour_renderer.visible = false;
+                }
             }
         }
         
-        // Update histograms if they exist
-        if (has_ringratio) {
-            // Global settings for all histograms
+        // Update histograms if they exist (existing code)
+        if (has_ringratio && typeof hist_renderers !== 'undefined' && typeof bins_slider !== 'undefined' && ringratio_slider) {
             const bins = bins_slider.value;
-            const min_ringratio = ringratio_slider.value[0];
-            const max_ringratio = ringratio_slider.value[1];
+            const min_rr_filter = ringratio_slider.value[0]; // Renamed to avoid conflict
+            const max_rr_filter = ringratio_slider.value[1]; // Renamed to avoid conflict
             
-            // Process each histogram
             for (const condition in hist_renderers) {
                 const hist_info = hist_renderers[condition];
                 const hist_renderer = hist_info.renderer;
                 const hist_source = hist_info.source;
-                const original_data = hist_info.original_data.data;
+                // Use the already filtered data from the scatter plot's original_data for consistency in filtering for histogram
+                // This requires that hist_info.original_data points to the same full dataset as scatter_renderers[condition].original_data
+                // And that we filter it here again based on *all* sliders
+                const original_hist_data = scatter_renderers[condition].original_data.data; // Use scatter's full original data
                 
-                // Set visibility based on condition selection
                 hist_renderer.visible = selected_conditions.includes(condition);
                 
                 if (hist_renderer.visible) {
-                    // Filter data based on filters
-                    const filtered_ringratio = [];
-                    
-                    if ('ringratio' in original_data) {
-                        for (let i = 0; i < original_data.ringratio.length; i++) {
-                            // Only include valid Ring Ratio values (positive numbers)
+                    const filtered_hist_ringratio = [];
+                    if (original_hist_data.ringratio) {
+                        for (let i = 0; i < original_hist_data.ringratio.length; i++) {
                             if (
-                                typeof original_data.ringratio[i] === 'number' &&
-                                !isNaN(original_data.ringratio[i]) &&
-                                original_data.ringratio[i] > 0 &&
-                                original_data.area[i] >= area_slider.value[0] &&
-                                original_data.area[i] <= area_slider.value[1] &&
-                                original_data.deformability[i] >= deform_slider.value[0] &&
-                                original_data.deformability[i] <= deform_slider.value[1] &&
-                                original_data.density[i] >= density_slider.value[0] &&
-                                original_data.density[i] <= density_slider.value[1] &&
-                                original_data.ringratio[i] >= min_ringratio &&
-                                original_data.ringratio[i] <= max_ringratio &&
-                                (!has_timestamp ||
-                                 (typeof original_data.rel_timestamp[i] === 'number' &&
-                                  !isNaN(original_data.rel_timestamp[i]) &&
-                                  original_data.rel_timestamp[i] >= timestamp_slider.value[0] &&
-                                  original_data.rel_timestamp[i] <= timestamp_slider.value[1]))
+                                typeof original_hist_data.ringratio[i] === 'number' &&
+                                !isNaN(original_hist_data.ringratio[i]) &&
+                                original_hist_data.ringratio[i] > 0 &&
+                                original_hist_data.area[i] >= area_slider.value[0] &&
+                                original_hist_data.area[i] <= area_slider.value[1] &&
+                                original_hist_data.deformability[i] >= deform_slider.value[0] &&
+                                original_hist_data.deformability[i] <= deform_slider.value[1] &&
+                                original_hist_data.density[i] >= density_slider.value[0] &&
+                                original_hist_data.density[i] <= density_slider.value[1] &&
+                                original_hist_data.ringratio[i] >= min_rr_filter && // Use renamed var
+                                original_hist_data.ringratio[i] <= max_rr_filter && // Use renamed var
+                                (!has_timestamp || !timestamp_slider ||
+                                 (typeof original_hist_data.rel_timestamp[i] === 'number' &&
+                                  !isNaN(original_hist_data.rel_timestamp[i]) &&
+                                  original_hist_data.rel_timestamp[i] >= timestamp_slider.value[0] &&
+                                  original_hist_data.rel_timestamp[i] <= timestamp_slider.value[1]))
                             ) {
-                                filtered_ringratio.push(original_data.ringratio[i]);
+                                filtered_hist_ringratio.push(original_hist_data.ringratio[i]);
                             }
                         }
                     }
                     
-                    // Create histogram data
-                    if (filtered_ringratio.length > 0) {
-                        // Create bins
+                    if (filtered_hist_ringratio.length > 0) {
                         const bin_edges = [];
-                        const bin_width = (max_ringratio - min_ringratio) / bins;
+                        // Calculate actual min/max from filtered_hist_ringratio for histogram range, or use slider range
+                        let actual_min_rr_for_hist = min_rr_filter;
+                        let actual_max_rr_for_hist = max_rr_filter;
+                        // Optional: Recalculate min/max from filtered_hist_ringratio if you want bins to adapt to filtered data
+                        // actual_min_rr_for_hist = Math.min(...filtered_hist_ringratio);
+                        // actual_max_rr_for_hist = Math.max(...filtered_hist_ringratio);
+                        // if (actual_min_rr_for_hist >= actual_max_rr_for_hist) actual_max_rr_for_hist = actual_min_rr_for_hist + 1e-9;
+
+
+                        const bin_width = (actual_max_rr_for_hist - actual_min_rr_for_hist) / bins;
                         
                         for (let i = 0; i <= bins; i++) {
-                            bin_edges.push(min_ringratio + i * bin_width);
+                            bin_edges.push(actual_min_rr_for_hist + i * bin_width);
                         }
                         
-                        // Initialize bin counts
                         const bin_counts = Array(bins).fill(0);
                         
-                        // Count values in each bin
-                        for (let i = 0; i < filtered_ringratio.length; i++) {
-                            const value = filtered_ringratio[i];
-                            // Handle edge case for max value
-                            if (value === max_ringratio) {
+                        for (let i = 0; i < filtered_hist_ringratio.length; i++) {
+                            const value = filtered_hist_ringratio[i];
+                            if (value === actual_max_rr_for_hist && bin_width > 0) { // ensure bin_width > 0
                                 bin_counts[bins - 1]++;
-                            } else {
-                                const bin_index = Math.floor((value - min_ringratio) / bin_width);
+                            } else if (bin_width > 0) { // ensure bin_width > 0
+                                const bin_index = Math.floor((value - actual_min_rr_for_hist) / bin_width);
                                 if (bin_index >= 0 && bin_index < bins) {
                                     bin_counts[bin_index]++;
                                 }
+                            } else if (bins === 1 && value >= actual_min_rr_for_hist && value <= actual_max_rr_for_hist) { // single bin case
+                                bin_counts[0]++;
                             }
                         }
                         
-                        // Create histogram data
-                        const hist_data = {
+                        const hist_data_new = { // Renamed to avoid conflict
                             'top': bin_counts,
                             'left': bin_edges.slice(0, -1),
                             'right': bin_edges.slice(1),
                             'condition': Array(bins).fill(condition)
                         };
-                        
-                        // Update source
-                        hist_source.data = hist_data;
+                        hist_source.data = hist_data_new;
+                        hist_renderer.glyph.fill_alpha = general_opacity;
+                    } else {
+                        hist_source.data = {'top': [], 'left': [], 'right': [], 'condition': []}; // Clear histogram
                     }
-                    
-                    // Update appearance
-                    hist_renderer.glyph.fill_alpha = opacity_slider.value;
+                } else { // if hist_renderer not visible
+                     hist_source.data = {'top': [], 'left': [], 'right': [], 'condition': []}; // Clear histogram
                 }
             }
         }
@@ -1468,7 +1668,10 @@ class SQLPlotter:
             'stats_div': stats_div,
             'scatter_renderers': scatter_renderers,
             'has_ringratio': has_ringratio,
-            'has_timestamp': has_timestamp
+            'has_timestamp': has_timestamp,
+            'contour_level_slider': contour_level_slider,
+            'contour_opacity_slider': contour_opacity_slider,
+            'contour_width_slider': contour_width_slider
         }
         
         if has_ringratio:
@@ -1489,6 +1692,13 @@ class SQLPlotter:
         density_slider.js_on_change('value', js_callback)
         opacity_slider.js_on_change('value', js_callback)
         point_size_slider.js_on_change('value', js_callback)
+        
+        # Connect contour slider
+        contour_level_slider.js_on_change('value', js_callback)
+        
+        # Connect new contour appearance sliders
+        contour_opacity_slider.js_on_change('value', js_callback)
+        contour_width_slider.js_on_change('value', js_callback)
         
         if has_ringratio:
             ringratio_slider.js_on_change('value', js_callback)
@@ -1530,12 +1740,21 @@ class SQLPlotter:
         if has_ringratio:
             appearance_controls.children.append(bins_slider)
         
+        # Add contour slider to controls layout
+        contour_controls = column(
+            Div(text="<h3>Contour Lines:</h3>"),
+            contour_level_slider,
+            contour_opacity_slider,
+            contour_width_slider
+        )
+
         controls = column(
             Div(text="<h2>Cell Data Visualization</h2>"),
             Div(text="<h3>Select Conditions:</h3>"),
             condition_select,
             filters_controls,
             appearance_controls,
+            contour_controls, # Add new contour controls
             stats_div
         )
         
