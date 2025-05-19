@@ -1013,9 +1013,6 @@ class SQLPlotter:
                     else:
                         print(f"Warning: No valid RingRatio values for condition '{condition}'")
         
-        # Create color mapper
-        color_mapper = LinearColorMapper(palette=Turbo256, low=min_density, high=max_density)
-        
         # Create hover tool
         hover = HoverTool(tooltips=[
             ("Condition", "@condition"),
@@ -1074,21 +1071,6 @@ class SQLPlotter:
                 'original_data': ColumnDataSource(data=df),
                 'color': color
             }
-        
-        # Add color bar for density
-        scatter_plot.scatter(
-            x=[], y=[], 
-            size=0,
-            fill_color={'field': 'density', 'transform': color_mapper},
-        )
-        
-        color_bar = ColorBar(
-            color_mapper=color_mapper,
-            title="Density",
-            location=(0, 0),
-            title_text_font_size="12pt"
-        )
-        scatter_plot.add_layout(color_bar, 'right')
         
         # Configure legend
         scatter_plot.legend.click_policy = "hide"
